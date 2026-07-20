@@ -1,0 +1,96 @@
+{
+  "scenarioId": "permission-denied",
+  "name": "Permission Denied on Restore",
+  "category": "permission_error",
+  "tags": [
+    "auth",
+    "permission-denied",
+    "restore",
+    "non-transient"
+  ],
+  "description": "A restore fails because the credentials issued to the backup service no longer have sufficient scope to read from the target bucket, following an unrelated access-policy change. Retries fail identically since the condition is not transient.",
+  "customer": "Globex Financial",
+  "jobId": "job-restore-globex-04471",
+  "correlationId": "corr-2d81ffa6",
+  "componentsInvolved": [
+    "backup_service",
+    "auth",
+    "storage"
+  ],
+  "expectedOutcome": "FAILED",
+  "expectedFailureSignature": "auth issues a token immediately after a policy update; storage rejects every subsequent read with ACCESS_DENIED (403); retries do not change the outcome because the token's scope, not its validity, is the problem.",
+  "logs": [
+    {
+      "timestamp": "2026-07-03T14:05:00Z",
+      "correlationId": "corr-2d81ffa6",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Restore job job-restore-globex-04471 initiated for volume recovery-db-07"
+    },
+    {
+      "timestamp": "2026-07-03T14:04:58Z",
+      "correlationId": "corr-2d81ffa6",
+      "componentId": "comp-auth-service",
+      "component": "auth",
+      "level": "WARN",
+      "errorCode": null,
+      "message": "Policy update applied to role backup-service-role by security-review-bot, scope narrowed to exclude s3:GetObject on globex-restore-bucket"
+    },
+    {
+      "timestamp": "2026-07-03T14:05:02Z",
+      "correlationId": "corr-2d81ffa6",
+      "componentId": "comp-auth-service",
+      "component": "auth",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Issued session token for role backup-service-role, ttl=900s"
+    },
+    {
+      "timestamp": "2026-07-03T14:05:06Z",
+      "correlationId": "corr-2d81ffa6",
+      "componentId": "comp-storage-primary",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "ACCESS_DENIED",
+      "message": "GetObject denied: 403 Forbidden \u2014 principal lacks s3:GetObject on globex-restore-bucket"
+    },
+    {
+      "timestamp": "2026-07-03T14:05:07Z",
+      "correlationId": "corr-2d81ffa6",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "WARN",
+      "errorCode": null,
+      "message": "Access denied detected, scheduling retry 1/2"
+    },
+    {
+      "timestamp": "2026-07-03T14:06:20Z",
+      "correlationId": "corr-2d81ffa6",
+      "componentId": "comp-storage-primary",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "ACCESS_DENIED",
+      "message": "Retry 1/2: GetObject denied: 403 Forbidden \u2014 same principal, same policy"
+    },
+    {
+      "timestamp": "2026-07-03T14:08:45Z",
+      "correlationId": "corr-2d81ffa6",
+      "componentId": "comp-storage-primary",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "ACCESS_DENIED",
+      "message": "Retry 2/2: GetObject denied: 403 Forbidden \u2014 same principal, same policy"
+    },
+    {
+      "timestamp": "2026-07-03T14:08:46Z",
+      "correlationId": "corr-2d81ffa6",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "ERROR",
+      "errorCode": "PERMISSION_DENIED",
+      "message": "Job job-restore-globex-04471 marked FAILED: insufficient permissions, escalate to access owner"
+    }
+  ]
+}

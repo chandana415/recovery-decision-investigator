@@ -1,0 +1,96 @@
+{
+  "scenarioId": "storage-quota-exceeded",
+  "name": "Storage Quota Exceeded During Backup",
+  "category": "resource_exhaustion",
+  "tags": [
+    "storage",
+    "quota",
+    "resource-exhaustion",
+    "backup"
+  ],
+  "description": "A scheduled full backup aborts partway through upload because the destination storage account has exhausted its provisioned quota. A monitoring warning fired earlier but was not acted on before the job ran.",
+  "customer": "Initech LLC",
+  "jobId": "job-weekly-initech-15029",
+  "correlationId": "corr-b19c44d0",
+  "componentsInvolved": [
+    "backup_service",
+    "storage",
+    "monitoring"
+  ],
+  "expectedOutcome": "FAILED",
+  "expectedFailureSignature": "A monitoring QUOTA_WARNING precedes the job by hours; the terminal error is a storage QUOTA_EXCEEDED (HTTP 403) partway through upload, followed by backup_service marking the job FAILED.",
+  "logs": [
+    {
+      "timestamp": "2026-06-28T04:00:00Z",
+      "correlationId": "corr-b19c44d0",
+      "componentId": "comp-monitoring",
+      "component": "monitoring",
+      "level": "WARN",
+      "errorCode": "QUOTA_WARNING",
+      "message": "Storage account initech-backups at 92% of provisioned 500GB quota"
+    },
+    {
+      "timestamp": "2026-06-28T09:41:00Z",
+      "correlationId": "corr-b19c44d0",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Weekly full backup job job-weekly-initech-15029 triggered"
+    },
+    {
+      "timestamp": "2026-06-28T09:41:10Z",
+      "correlationId": "corr-b19c44d0",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "PUT block blob initiated: initech/full-20260628.tar.gz.enc (30GB)"
+    },
+    {
+      "timestamp": "2026-06-28T09:52:44Z",
+      "correlationId": "corr-b19c44d0",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Upload progress: 61% (18.3GB / 30GB)"
+    },
+    {
+      "timestamp": "2026-06-28T10:03:12Z",
+      "correlationId": "corr-b19c44d0",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "QUOTA_EXCEEDED",
+      "message": "PUT block failed: 403 Forbidden \u2014 storage account quota exceeded (500GB/500GB used)"
+    },
+    {
+      "timestamp": "2026-06-28T10:03:15Z",
+      "correlationId": "corr-b19c44d0",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "ERROR",
+      "errorCode": "QUOTA_EXCEEDED",
+      "message": "Upload aborted due to destination quota; retry suppressed (non-transient error)"
+    },
+    {
+      "timestamp": "2026-06-28T10:03:16Z",
+      "correlationId": "corr-b19c44d0",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "ERROR",
+      "errorCode": "JOB_FAILED",
+      "message": "Job job-weekly-initech-15029 marked FAILED, exit code 1"
+    },
+    {
+      "timestamp": "2026-06-28T10:03:20Z",
+      "correlationId": "corr-b19c44d0",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Partial blob cleanup completed for initech/full-20260628.tar.gz.enc"
+    }
+  ]
+}

@@ -1,0 +1,132 @@
+{
+  "scenarioId": "service-unavailable",
+  "name": "Encryption Service Unavailable Mid-Operation (Recovered)",
+  "category": "service_unavailable",
+  "tags": [
+    "encryption",
+    "service-unavailable",
+    "self-healing",
+    "recovery-pattern"
+  ],
+  "description": "The encryption key service becomes temporarily unavailable during a backup upload. The backup service detects the outage, backs off, and retries; the encryption service recovers and the job completes successfully. Included to demonstrate a successful automatic-recovery pattern, not just terminal failure.",
+  "customer": "Acme Corp",
+  "jobId": "job-nightly-acme-88213",
+  "correlationId": "corr-91aa50c3",
+  "componentsInvolved": [
+    "backup_service",
+    "encryption",
+    "storage"
+  ],
+  "expectedOutcome": "RECOVERED",
+  "expectedFailureSignature": "encryption reports SERVICE_UNAVAILABLE for a ~90s window; backup_service retries with exponential backoff and succeeds once encryption reports HEALTHY again \u2014 the job's final status is SUCCEEDED despite a mid-operation outage.",
+  "logs": [
+    {
+      "timestamp": "2026-07-01T03:10:02Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Nightly backup job job-nightly-acme-88213 started for tenant acme-corp"
+    },
+    {
+      "timestamp": "2026-07-01T03:10:05Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-storage-primary",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Snapshot created: snap-acme-20260701-0310, size=482GB"
+    },
+    {
+      "timestamp": "2026-07-01T03:10:12Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Multipart upload started for acme-corp/snap-acme-20260701-0310.tar.gz.enc"
+    },
+    {
+      "timestamp": "2026-07-01T03:14:40Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-encryption-service",
+      "component": "encryption",
+      "level": "ERROR",
+      "errorCode": "SERVICE_UNAVAILABLE",
+      "message": "Key service entering maintenance mode, all Encrypt/Decrypt calls returning 503"
+    },
+    {
+      "timestamp": "2026-07-01T03:14:51Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "SERVICE_UNAVAILABLE",
+      "message": "UploadPart failed for partNumber=214: encryption dependency unavailable (503)"
+    },
+    {
+      "timestamp": "2026-07-01T03:14:52Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "WARN",
+      "errorCode": null,
+      "message": "Dependency outage detected on encryption; entering backoff-retry mode (max 5 attempts)"
+    },
+    {
+      "timestamp": "2026-07-01T03:15:10Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-encryption-service",
+      "component": "encryption",
+      "level": "ERROR",
+      "errorCode": "SERVICE_UNAVAILABLE",
+      "message": "Retry 1: still in maintenance mode"
+    },
+    {
+      "timestamp": "2026-07-01T03:15:50Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-encryption-service",
+      "component": "encryption",
+      "level": "ERROR",
+      "errorCode": "SERVICE_UNAVAILABLE",
+      "message": "Retry 2: still in maintenance mode"
+    },
+    {
+      "timestamp": "2026-07-01T03:16:12Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-encryption-service",
+      "component": "encryption",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Key service exiting maintenance mode, status HEALTHY"
+    },
+    {
+      "timestamp": "2026-07-01T03:16:20Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Retry 3: UploadPart succeeded for partNumber=214"
+    },
+    {
+      "timestamp": "2026-07-01T03:19:44Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Multipart upload completed for acme-corp/snap-acme-20260701-0310.tar.gz.enc"
+    },
+    {
+      "timestamp": "2026-07-01T03:19:45Z",
+      "correlationId": "corr-91aa50c3",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Job job-nightly-acme-88213 marked SUCCEEDED after recovering from a transient encryption outage"
+    }
+  ]
+}

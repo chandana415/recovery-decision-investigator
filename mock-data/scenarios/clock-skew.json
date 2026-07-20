@@ -1,0 +1,105 @@
+{
+  "scenarioId": "clock-skew",
+  "name": "Clock Skew Causes Signed Request Rejection",
+  "category": "clock_skew",
+  "tags": [
+    "clock-skew",
+    "storage",
+    "monitoring",
+    "signed-requests"
+  ],
+  "description": "The backup service host's system clock has drifted significantly ahead of the storage service's clock. Signed upload requests fall outside the storage service's allowed time-skew window and are rejected, even though nothing else about the request is invalid. Monitoring only detects the drift after the job has already failed.",
+  "customer": "Nakamura Robotics",
+  "jobId": "job-nightly-nakamura-51288",
+  "correlationId": "corr-5c60e17b",
+  "componentsInvolved": [
+    "backup_service",
+    "storage",
+    "monitoring"
+  ],
+  "expectedOutcome": "FAILED",
+  "expectedFailureSignature": "storage repeatedly rejects otherwise-valid signed requests with REQUEST_TIME_TOO_SKEWED; the backup_service host's clock and the storage service's clock differ by several minutes, confirmed retroactively by a monitoring CLOCK_SKEW_DETECTED entry.",
+  "logs": [
+    {
+      "timestamp": "2026-07-04T01:00:00Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Nightly backup job job-nightly-nakamura-51288 started (host clock: 2026-07-04T01:00:00.412Z)"
+    },
+    {
+      "timestamp": "2026-07-04T01:00:03Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "PUT object initiated: nakamura/full-20260704.tar.gz.enc"
+    },
+    {
+      "timestamp": "2026-07-04T01:00:04Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "REQUEST_TIME_TOO_SKEWED",
+      "message": "Request signature timestamp 2026-07-04T01:06:18Z is 6m14s ahead of server time; max allowed skew is 300s"
+    },
+    {
+      "timestamp": "2026-07-04T01:00:35Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "WARN",
+      "errorCode": null,
+      "message": "Signature rejected, re-signing and retrying (attempt 1/3)"
+    },
+    {
+      "timestamp": "2026-07-04T01:00:36Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "REQUEST_TIME_TOO_SKEWED",
+      "message": "Retry 1: request signature timestamp still 6m15s ahead of server time"
+    },
+    {
+      "timestamp": "2026-07-04T01:01:20Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "REQUEST_TIME_TOO_SKEWED",
+      "message": "Retry 2: request signature timestamp still 6m16s ahead of server time"
+    },
+    {
+      "timestamp": "2026-07-04T01:02:47Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "REQUEST_TIME_TOO_SKEWED",
+      "message": "Retry 3: request signature timestamp still 6m16s ahead of server time"
+    },
+    {
+      "timestamp": "2026-07-04T01:02:48Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "ERROR",
+      "errorCode": "RETRY_EXHAUSTED",
+      "message": "Job job-nightly-nakamura-51288 marked FAILED after 3 signature-rejected retries"
+    },
+    {
+      "timestamp": "2026-07-04T01:15:00Z",
+      "correlationId": "corr-5c60e17b",
+      "componentId": "comp-monitoring",
+      "component": "monitoring",
+      "level": "ERROR",
+      "errorCode": "CLOCK_SKEW_DETECTED",
+      "message": "NTP sync check failed on backup-host-nakamura-04 for 3 consecutive cycles; local clock is 6m17s ahead of reference time"
+    }
+  ]
+}

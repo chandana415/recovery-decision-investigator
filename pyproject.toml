@@ -1,0 +1,23 @@
+[project]
+name = "recovery-workspace"
+version = "0.1.0"
+description = "Recovery Investigation Workspace - Week 1 thin vertical slice"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+    "streamlit>=1.30",
+    "openai>=2.45.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["recovery_workspace*"]

@@ -1,0 +1,155 @@
+{
+  "scenarioId": "partial-failure",
+  "name": "Partial Failure Across Parallel Volume Backups",
+  "category": "partial_failure",
+  "tags": [
+    "partial-failure",
+    "parallel-tasks",
+    "network",
+    "storage",
+    "recovery-pattern"
+  ],
+  "description": "A single backup job fans out into parallel per-volume tasks. Two of four volumes back up successfully; one fails permanently due to a network blip that never recovers, and one recovers after a single retry. The overall job finishes in a PARTIAL_SUCCESS state rather than a clean pass/fail.",
+  "customer": "Umbrella Biotech",
+  "jobId": "job-nightly-umbrella-72390",
+  "correlationId": "corr-a44e70f2",
+  "componentsInvolved": [
+    "backup_service",
+    "storage",
+    "network"
+  ],
+  "expectedOutcome": "PARTIAL_SUCCESS",
+  "expectedFailureSignature": "Four child tasks share correlationId corr-a44e70f2 but have distinct traceIds; task 3 fails permanently (ECONNRESET, retry not attempted per policy after hard reset) while task 2 recovers after one retry \u2014 the parent job status is PARTIAL_SUCCESS with 3/4 volumes backed up.",
+  "logs": [
+    {
+      "timestamp": "2026-07-05T21:10:00Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-parent",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Job job-nightly-umbrella-72390 started; fanning out to 4 parallel volume tasks"
+    },
+    {
+      "timestamp": "2026-07-05T21:10:02Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-1",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Task 1/4 started: volume vol-umbrella-lab-01"
+    },
+    {
+      "timestamp": "2026-07-05T21:10:02Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-2",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Task 2/4 started: volume vol-umbrella-lab-02"
+    },
+    {
+      "timestamp": "2026-07-05T21:10:02Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-3",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Task 3/4 started: volume vol-umbrella-genomics-01"
+    },
+    {
+      "timestamp": "2026-07-05T21:10:02Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-4",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Task 4/4 started: volume vol-umbrella-genomics-02"
+    },
+    {
+      "timestamp": "2026-07-05T21:14:20Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-1",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Task 1/4 upload completed successfully (61GB)"
+    },
+    {
+      "timestamp": "2026-07-05T21:15:03Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-2",
+      "componentId": "comp-network-gateway",
+      "component": "network",
+      "level": "ERROR",
+      "errorCode": "ETIMEDOUT",
+      "message": "Task 2/4 upload timed out after 30000ms"
+    },
+    {
+      "timestamp": "2026-07-05T21:15:04Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-2",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "WARN",
+      "errorCode": null,
+      "message": "Task 2/4 scheduling retry 1/1"
+    },
+    {
+      "timestamp": "2026-07-05T21:16:40Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-2",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Task 2/4 retry succeeded, upload completed (74GB)"
+    },
+    {
+      "timestamp": "2026-07-05T21:16:55Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-3",
+      "componentId": "comp-network-gateway",
+      "component": "network",
+      "level": "ERROR",
+      "errorCode": "ECONNRESET",
+      "message": "Task 3/4 connection reset by peer during upload of vol-umbrella-genomics-01"
+    },
+    {
+      "timestamp": "2026-07-05T21:16:56Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-3",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "ERROR",
+      "errorCode": "ECONNRESET",
+      "message": "Task 3/4 marked FAILED: hard reset is treated as non-retryable per policy"
+    },
+    {
+      "timestamp": "2026-07-05T21:19:12Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-task-4",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Task 4/4 upload completed successfully (58GB)"
+    },
+    {
+      "timestamp": "2026-07-05T21:19:15Z",
+      "correlationId": "corr-a44e70f2",
+      "traceId": "corr-a44e70f2-parent",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "WARN",
+      "errorCode": "PARTIAL_SUCCESS",
+      "message": "Job job-nightly-umbrella-72390 completed with 3/4 volumes succeeded, 1 failed (vol-umbrella-genomics-01)"
+    }
+  ]
+}

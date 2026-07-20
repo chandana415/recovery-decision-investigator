@@ -1,0 +1,132 @@
+{
+  "scenarioId": "network-timeout",
+  "name": "Network Timeout During Restore",
+  "category": "network_timeout",
+  "tags": [
+    "network",
+    "timeout",
+    "restore",
+    "retry-exhausted"
+  ],
+  "description": "A restore operation fails because the network path between the backup service and cloud storage becomes intermittently unreachable, causing repeated read timeouts until all automatic retries are exhausted.",
+  "customer": "Vertex Logistics",
+  "jobId": "job-restore-vertex-30021",
+  "correlationId": "corr-7f3e9a21",
+  "componentsInvolved": [
+    "backup_service",
+    "network",
+    "storage"
+  ],
+  "expectedOutcome": "FAILED",
+  "expectedFailureSignature": "Repeated ETIMEDOUT errors on the network component immediately precede backup_service reporting RETRY_EXHAUSTED and the job failing.",
+  "logs": [
+    {
+      "timestamp": "2026-07-06T02:00:00Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "Restore job job-restore-vertex-30021 initiated for volume vol-vertex-erp-02"
+    },
+    {
+      "timestamp": "2026-07-06T02:00:01Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-network-gateway",
+      "component": "network",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "VPN tunnel vpn-tunnel-us-east-3 established for restore session"
+    },
+    {
+      "timestamp": "2026-07-06T02:00:04Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "GetObject started for vertex/vol-vertex-erp-02/snapshot-20260705.img"
+    },
+    {
+      "timestamp": "2026-07-06T02:01:47Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-network-gateway",
+      "component": "network",
+      "level": "WARN",
+      "errorCode": "PACKET_LOSS",
+      "message": "Elevated packet loss detected on vpn-tunnel-us-east-3 (14% over last 30s)"
+    },
+    {
+      "timestamp": "2026-07-06T02:02:15Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "ETIMEDOUT",
+      "message": "GetObject read timed out after 30000ms"
+    },
+    {
+      "timestamp": "2026-07-06T02:02:16Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "WARN",
+      "errorCode": null,
+      "message": "Read timeout detected, scheduling retry 1/3 with exponential backoff"
+    },
+    {
+      "timestamp": "2026-07-06T02:02:46Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-network-gateway",
+      "component": "network",
+      "level": "ERROR",
+      "errorCode": "ENETUNREACH",
+      "message": "vpn-tunnel-us-east-3 flapped: tunnel down"
+    },
+    {
+      "timestamp": "2026-07-06T02:02:47Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "ERROR",
+      "errorCode": "ETIMEDOUT",
+      "message": "Retry 1/3 failed: connection unreachable"
+    },
+    {
+      "timestamp": "2026-07-06T02:04:10Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-network-gateway",
+      "component": "network",
+      "level": "INFO",
+      "errorCode": null,
+      "message": "vpn-tunnel-us-east-3 re-established"
+    },
+    {
+      "timestamp": "2026-07-06T02:04:41Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "ETIMEDOUT",
+      "message": "Retry 2/3: GetObject read timed out after 30000ms"
+    },
+    {
+      "timestamp": "2026-07-06T02:07:55Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-storage-cloud",
+      "component": "storage",
+      "level": "ERROR",
+      "errorCode": "ETIMEDOUT",
+      "message": "Retry 3/3: GetObject read timed out after 30000ms"
+    },
+    {
+      "timestamp": "2026-07-06T02:07:56Z",
+      "correlationId": "corr-7f3e9a21",
+      "componentId": "comp-backup-service",
+      "component": "backup_service",
+      "level": "ERROR",
+      "errorCode": "RETRY_EXHAUSTED",
+      "message": "All 3 retries failed due to network timeouts; job job-restore-vertex-30021 marked FAILED"
+    }
+  ]
+}

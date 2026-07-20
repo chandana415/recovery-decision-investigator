@@ -1,0 +1,7 @@
+[
+  { "scenarioId": "storage-quota-exceeded",   "file": "scenarios/storage-quota-exceeded.json",   "category": "resource_exhaustion", "outcome": "FAILED",          "componentsInvolved": ["backup_service", "storage", "monitoring"], "status": "active" },
+  { "scenarioId": "network-timeout",          "file": "scenarios/network-timeout.json",          "category": "network_timeout",     "outcome": "FAILED",          "componentsInvolved": ["backup_service", "network", "storage"],    "status": "deferred" },
+  { "scenarioId": "permission-denied",        "file": "scenarios/permission-denied.json",        "category": "permission_error",    "outcome": "FAILED",          "componentsInvolved": ["backup_service", "auth", "storage"],       "status": "deferred" },
+  { "scenarioId": "service-unavailable",      "file": "scenarios/service-unavailable.json",      "category": "service_unavailable", "outcome": "RECOVERED",       "componentsInvolved": ["backup_service", "encryption", "storage"], "status": "deferred" },
+  { "scenarioId": "clock-skew",               "file": "scenarios/clock-skew.json",               "category": "clock_skew",          "outcome": "FAILED",          "componentsInvolved": ["backup_service", "storage", "monitoring"],  "status": "deferred" }
+]

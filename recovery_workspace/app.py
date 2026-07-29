@@ -7,6 +7,7 @@ from time import perf_counter
 import re
 from datetime import datetime, timezone
 from typing import Optional
+from uuid import uuid4
 
 import streamlit as st
 
@@ -16,8 +17,16 @@ from recovery_workspace.investigation import (
     generate_llm_investigation_summary,
     generate_simulated_investigation_summary,
 )
+from recovery_workspace.models import Scenario, LogEntry
 from recovery_workspace.parser import parse_scenario
 from recovery_workspace.timeline import build_timeline
+from recovery_workspace.uploader import (
+    parse_uploaded_logs,
+    parse_uploaded_logs_with_source,
+    process_multiple_uploads,
+    read_uploaded_file_safe,
+    validate_upload,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCENARIOS_DIR = REPO_ROOT / "mock-data" / "scenarios"
@@ -153,6 +162,22 @@ def confidence_breakdown_rows(breakdown: dict[str, float]) -> list[dict[str, str
     return rows
 
 
+def confidence_debug_rows(breakdown: dict[str, float]) -> list[dict[str, str]]:
+    rows = []
+    running_total = 0.0
+    for key in ("causal_signal", "corroboration", "temporal_coherence", "consistency", "ambiguity_penalty"):
+        value = breakdown.get(key, 0.0)
+        running_total += value
+        rows.append(
+            {
+                "Component": key,
+                "Value": f"{value:.2f}",
+                "Running total": f"{running_total:.2f}",
+            }
+        )
+    return rows
+
+
 def final_score_text(confidence: float) -> str:
     return f"Final Investigation Confidence: {confidence:.0%}"
 
@@ -204,14 +229,18 @@ def format_component_source(component: str) -> str:
     return component.replace("_", " ").title()
 
 
-def format_component_name(component_id: str | None) -> str:
+def normalize_component_key(component: str) -> str:
+    return component.replace("_", "-").strip().lower()
+
+
+def format_component_name(component_id: Optional[str]) -> str:
     if not component_id:
         return ""
     normalized = component_id.replace("comp-", "").replace("-", " ").replace("_", " ").strip()
     return normalized.title()
 
 
-def split_root_cause_text(text: str) -> tuple[str, str | None]:
+def split_root_cause_text(text: str) -> tuple[str, Optional[str]]:
     marker = " Most likely causal event: "
     if marker not in text:
         return text, None
@@ -219,7 +248,7 @@ def split_root_cause_text(text: str) -> tuple[str, str | None]:
     return summary_text.strip(), event_text.strip().rstrip(".")
 
 
-def summarize_causal_event(event_text: str | None) -> str | None:
+def summarize_causal_event(event_text: Optional[str]) -> Optional[str]:
     if not event_text:
         return None
     match = re.match(r"(?P<component>\w+)\s+(?P<code>[A-Z0-9_]+)\s+at\s+(?P<timestamp>[^.]+)", event_text)
@@ -230,7 +259,7 @@ def summarize_causal_event(event_text: str | None) -> str | None:
     return f"{component} returned {code}."
 
 
-def parse_causal_event_identity(event_text: str | None) -> tuple[str | None, str | None]:
+def parse_causal_event_identity(event_text: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     if not event_text:
         return None, None
     match = re.match(r"(?P<component>\w+)\s+(?P<code>[A-Z0-9_]+)\s+at\s+(?P<timestamp>[^.]+)", event_text)
@@ -239,25 +268,25 @@ def parse_causal_event_identity(event_text: str | None) -> tuple[str | None, str
     return match.group("component"), match.group("code")
 
 
-def terminal_outcome_sequence(timeline) -> int | None:
+def terminal_outcome_sequence(timeline) -> Optional[int]:
     terminal_codes = {"JOB_FAILED", "RETRY_EXHAUSTED", "PERMISSION_DENIED", "PARTIAL_SUCCESS"}
     sequence = None
     for entry in timeline.entries:
         message = entry.event.message.lower()
         if entry.event.error_code in terminal_codes or (
-            entry.event.component == "backup_service"
+            normalize_component_key(entry.event.component) == "backup-service"
             and ("marked failed" in message or "completed with" in message or "marked succeeded" in message)
         ):
             sequence = entry.sequence
     return sequence
 
 
-def causal_event_sequence(timeline, causal_event_text: str | None) -> int | None:
+def causal_event_sequence(timeline, causal_event_text: Optional[str]) -> Optional[int]:
     component, code = parse_causal_event_identity(causal_event_text)
     if component is None and code is None:
         return None
     for entry in timeline.entries:
-        if component is not None and entry.event.component != component:
+        if component is not None and normalize_component_key(entry.event.component) != normalize_component_key(component):
             continue
         if code is not None and entry.event.error_code != code:
             continue
@@ -275,7 +304,7 @@ def format_event_timestamp(
     timestamp_text: str,
     *,
     display_mode: str = "utc",
-    reference_timestamp_text: str | None = None,
+    reference_timestamp_text: Optional[str] = None,
 ) -> str:
     """Format an ISO-8601 timestamp for UI display.
 
@@ -303,7 +332,7 @@ def format_event_timestamp(
     return utc_time.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def evidence_timeline_items(timeline, causal_event_text: str | None) -> list[dict[str, str]]:
+def evidence_timeline_items(timeline, causal_event_text: Optional[str]) -> list[dict[str, str]]:
     causal_sequence = causal_event_sequence(timeline, causal_event_text)
     outcome_sequence = terminal_outcome_sequence(timeline)
     selected_sequences: set[int] = set()
@@ -420,8 +449,8 @@ def root_cause_reason(summary_explanations: list[str]) -> str:
 
 def confidence_reason_lines(timeline, summary_explanations: list[str]) -> tuple[list[str], str]:
     preferred = ["monitoring", "backup_service", "storage", "network", "auth", "encryption"]
-    available = {entry.event.component for entry in timeline.entries}
-    ordered = [component for component in preferred if component in available]
+    available = {normalize_component_key(entry.event.component) for entry in timeline.entries}
+    ordered = [component for component in preferred if normalize_component_key(component) in available]
     if not ordered:
         ordered = sorted(available)
     lines = [f"{format_component_source(component)} events" for component in ordered[:3]]
@@ -624,6 +653,62 @@ def active_scenario_path() -> Path:
     return REPO_ROOT / "mock-data" / active[0]["file"]
 
 
+def build_uploaded_scenario(filenames: list[str], logs: list[LogEntry]) -> Scenario:
+    """Build a synthetic Scenario from uploaded logs."""
+    # Normalize all logs to use the same correlation ID (required by timeline builder)
+    # Try to use the most specific job ID if one exists, otherwise generate a unique one
+    job_ids = [log.correlation_id for log in logs if log.correlation_id and log.correlation_id.startswith('job-')]
+    if job_ids:
+        # Use the most common job ID, or the first one found
+        normalized_correlation_id = job_ids[0]
+    else:
+        # Generate a unique correlation ID for this investigation
+        normalized_correlation_id = f"uploaded-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    
+    # Update all logs to use the normalized correlation ID
+    for log in logs:
+        log.correlation_id = normalized_correlation_id
+    
+    # Compute real start/end times from log timestamps
+    timestamps = []
+    for log in logs:
+        try:
+            if isinstance(log.timestamp, str):
+                # Parse ISO format timestamp
+                ts = datetime.fromisoformat(log.timestamp.replace("Z", "+00:00"))
+            else:
+                ts = log.timestamp
+            timestamps.append(ts)
+        except Exception:
+            pass  # Skip unparseable timestamps
+    
+    # Determine expected outcome based on error presence
+    error_entries = [log for log in logs if log.level and log.level.upper() == "ERROR"]
+    if error_entries:
+        expected_outcome = "FAILED"
+        failure_sig = f"User-uploaded logs: {len(error_entries)} error(s) detected"
+    else:
+        expected_outcome = "UNKNOWN"
+        failure_sig = "User-uploaded logs; investigation driven by evidence."
+    
+    file_label = ", ".join(filenames) if len(filenames) <= 3 else f"{len(filenames)} files"
+    
+    return Scenario(
+        scenario_id="uploaded",
+        name=f"Uploaded Logs: {file_label}",
+        category="uploaded",
+        tags=["uploaded"],
+        description="User-uploaded recovery logs for investigation.",
+        customer="[Uploaded Investigation]",
+        job_id=f"uploaded-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        correlation_id=normalized_correlation_id,
+        components_involved=list(set(log.component for log in logs if log.component)),
+        expected_outcome=expected_outcome,
+        expected_failure_signature=failure_sig,
+        logs=logs,
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Recovery Investigation Workspace", layout="wide")
     st.markdown(incident_summary_styles(), unsafe_allow_html=True)
@@ -636,19 +721,144 @@ def main() -> None:
     if "searched_job_id" not in st.session_state:
         st.session_state["searched_job_id"] = default_job_id
 
-    st.subheader("Find Recovery Job")
-    st.session_state["searched_job_id"] = st.text_input(
-        "Job ID",
-        value=st.session_state["searched_job_id"],
-        placeholder="search for job id or name",
-    ).strip()
+    # Initialize tab tracking in session state
+    if "active_tab" not in st.session_state:
+        st.session_state["active_tab"] = "demo"  # "demo" or "upload"
+    if "uploaded_scenario" not in st.session_state:
+        st.session_state["uploaded_scenario"] = None
+    if "uploaded_scenario_name" not in st.session_state:
+        st.session_state["uploaded_scenario_name"] = ""
 
-    selected_entry = find_job_entry(scenario_entries, st.session_state["searched_job_id"])
-    if selected_entry is None:
-        st.error("No recovery job found for that Job ID.")
+    # Tabs update state when interacted with
+    tab_demo, tab_upload = st.tabs(["Demo Scenario", "Upload Your Logs"])
+
+    scenario = None
+    scenario_path = None
+    upload_error = None
+
+    with tab_demo:
+        # User is on demo tab — mark it as active
+        st.session_state["active_tab"] = "demo"
+        # Clear any previously uploaded scenario when visiting demo tab
+        st.session_state["uploaded_scenario"] = None
+
+        st.subheader("Find Recovery Job")
+        st.session_state["searched_job_id"] = st.text_input(
+            "Job ID",
+            value=st.session_state["searched_job_id"],
+            placeholder="search for job id or name",
+        ).strip()
+
+        selected_entry = find_job_entry(scenario_entries, st.session_state["searched_job_id"])
+        if selected_entry is None:
+            st.error("No recovery job found for that Job ID.")
+        else:
+            scenario_path = selected_entry["path"]
+
+    with tab_upload:
+        # User is on upload tab — mark it as active and clear demo
+        st.session_state["active_tab"] = "upload"
+        scenario_path = None  # Force clear demo scenario on this tab
+
+        st.warning(
+            "⚠️ **Do not upload confidential production logs, credentials, access tokens, personal data, or customer-identifying information.** "
+            "This public prototype is intended for sanitized test data only."
+        )
+
+        uploaded_files = st.file_uploader(
+            "Upload your logs (.log, .txt, .json)",
+            type=["log", "txt", "json"],
+            accept_multiple_files=True,
+            key="log_uploader",
+        )
+
+        if uploaded_files:
+            # Process all files
+            merged_logs, file_results = process_multiple_uploads(uploaded_files)
+
+            # Show per-file summary
+            with st.expander("📋 File Processing Summary", expanded=True):
+                for filename, result in file_results.items():
+                    st.markdown(f"- {filename}: {result}")
+
+            # Check if any files succeeded
+            if not merged_logs:
+                st.error("❌ No events could be extracted from any uploaded file.")
+                upload_error = "All files failed to parse"
+                st.session_state["uploaded_scenario"] = None
+            else:
+                # Build synthetic scenario from merged logs
+                filenames = list(file_results.keys())
+                scenario = build_uploaded_scenario(filenames, merged_logs)
+                st.session_state["uploaded_scenario"] = scenario
+                st.session_state["uploaded_scenario_name"] = f"{len(filenames)} file(s)"
+
+                # Show success with file count
+                total_events = len(merged_logs)
+                successful_files = sum(
+                    1 for r in file_results.values() if r.startswith("✅")
+                )
+                st.success(
+                    f"✅ Loaded {total_events} total events from {successful_files} file(s)"
+                )
+        else:
+            # No files uploaded, check if we have a saved upload from session state
+            if st.session_state["uploaded_scenario"] is not None:
+                scenario = st.session_state["uploaded_scenario"]
+                st.info(f"ℹ️ Using previously uploaded: {st.session_state['uploaded_scenario_name']}")
+            else:
+                st.info("📤 Select files to upload to begin investigation.")
+
+    # Route to the correct scenario based on which tab is active
+    if st.session_state["active_tab"] == "upload":
+        # Use uploaded scenario
+        scenario = st.session_state.get("uploaded_scenario")
+        scenario_path = None
+    else:
+        # Use demo scenario
+        scenario = None
+        # scenario_path already set by demo tab logic above
+
+    # If no scenario selected in either tab, show error and return
+    if scenario_path is None and scenario is None:
+        if upload_error:
+            # Already showed error in upload tab
+            pass
+        else:
+            st.info("Select a demo job or upload logs to begin investigation.")
         return
 
-    scenario_path = selected_entry["path"]
+    # Load or use the uploaded scenario
+    if scenario_path is not None:
+        scenario, timeline, context, processing_timings = load_processed_scenario(scenario_path)
+    else:
+        # For uploaded scenario, build timeline and context
+        try:
+            timings = {}
+            checkpoint = perf_counter()
+            events = normalize_events(scenario.logs)
+            timings["normalize_events"] = perf_counter() - checkpoint
+
+            checkpoint = perf_counter()
+            timeline = build_timeline(events)
+            timings["build_timeline"] = perf_counter() - checkpoint
+
+            checkpoint = perf_counter()
+            context = build_investigation_context(
+                customer=scenario.customer,
+                job_id=scenario.job_id,
+                outcome=scenario.expected_outcome,
+                expected_failure_signature=scenario.expected_failure_signature,
+                timeline=timeline,
+                events=events,
+            )
+            timings["build_investigation_context"] = perf_counter() - checkpoint
+            processing_timings = dict(timings)
+            processing_timings["total_page_execution"] = sum(timings.values())
+        except Exception as e:
+            st.error(f"Failed to process uploaded logs: {str(e)}")
+            return
+
     show_developer_diagnostics = st.sidebar.checkbox(
         "Show developer diagnostics",
         value=False,
@@ -664,8 +874,6 @@ def main() -> None:
         )
         if analysis_mode == "Live OpenAI":
             should_generate_live = st.sidebar.button("Generate AI Investigation", type="primary")
-
-    scenario, timeline, context, processing_timings = load_processed_scenario(scenario_path)
 
     if analysis_mode == "Live OpenAI" and should_generate_live:
         with st.spinner("Generating AI investigation..."):
@@ -804,6 +1012,12 @@ def main() -> None:
         for line in reason_lines:
             st.write(f"• {line}")
         st.write(confidence_conclusion)
+
+        if show_developer_diagnostics:
+            with st.expander("Confidence component debug", expanded=False):
+                st.write("Component values before clamping and final formatting:")
+                st.dataframe(confidence_debug_rows(summary.confidence_breakdown), use_container_width=True, hide_index=True)
+                st.write(f"Raw summed confidence: {sum(summary.confidence_breakdown.values()):.2f}")
 
     diagnostics_payload = developer_diagnostics_payload(
         enabled=show_developer_diagnostics,

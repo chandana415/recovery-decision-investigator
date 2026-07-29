@@ -16,6 +16,11 @@ from openai import (
 )
 from pydantic import ValidationError
 
+try:
+    import streamlit as st
+except ImportError:
+    st = None  # For non-Streamlit contexts (tests, etc.)
+
 from recovery_workspace.models import (
     Event,
     EventContext,
@@ -28,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
 client: Optional[OpenAI] = None
-client_timeout_seconds: float | None = None
+client_timeout_seconds: Optional[float] = None
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 8.0
 
 
@@ -43,6 +48,7 @@ def _format_event_context(event: Event) -> EventContext:
         level=event.level,
         error_code=event.error_code,
         message=event.message,
+        structured_fields=event.structured_fields,
     )
 
 
@@ -55,6 +61,7 @@ def _format_timeline_entry_context(entry: Any) -> TimelineEntryContext:
         error_code=entry.event.error_code,
         message=entry.event.message,
         gap_before_seconds=entry.gap_before_seconds,
+        structured_fields=entry.event.structured_fields,
     )
 
 
@@ -62,12 +69,27 @@ def _get_llm_client(timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS) -> 
     global client, client_timeout_seconds
     if client is not None:
         return client
-    api_key = os.environ.get("OPENAI_API_KEY")
+    
+    # Try Streamlit secrets first (for Streamlit Cloud deployment)
+    api_key = None
+    if st is not None and hasattr(st, "secrets"):
+        try:
+            api_key = st.secrets.get("OPENAI_API_KEY")
+        except Exception:
+            pass  # st.secrets not available (e.g., in tests)
+    
+    # Fall back to environment variable
+    if not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY")
+    
     if not api_key:
         raise LLMRequestError(
-            "OPENAI_API_KEY environment variable is required for AI summarization."
+            "OPENAI_API_KEY not found. Configure it via: "
+            "1. (Streamlit Cloud) App Secrets dashboard, or "
+            "2. (Local dev) Environment variable OPENAI_API_KEY or .env file"
         )
-    client = OpenAI(max_retries=0, timeout=timeout_seconds)
+    
+    client = OpenAI(api_key=api_key, max_retries=0, timeout=timeout_seconds)
     client_timeout_seconds = timeout_seconds
     return client
 
@@ -205,14 +227,20 @@ FAILURE_RULES = [
     (
         "quota_exhaustion",
         {"QUOTA_EXCEEDED", "QUOTA_WARNING"},
-        ("quota", "capacity", "provisioned", "gb/", "used)", "disk full"),
+        ("quota", "capacity", "provisioned", "gb/", "used)", "disk full", "no space left on device", "out of space", "enospc"),
         {"storage", "monitoring", "backup_service"},
     ),
     (
         "permission_failure",
         {"ACCESS_DENIED", "PERMISSION_DENIED", "UNAUTHORIZED"},
-        ("forbidden", "lacks", "access denied", "permission denied", "principal"),
+        ("forbidden", "lacks", "access denied", "permission denied", "principal", "wrong password", "no key found", "authentication failed"),
         {"storage", "auth", "backup_service"},
+    ),
+    (
+        "corruption",
+        {"CORRUPTION_DETECTED", "PACK_ID_MISMATCH", "CHECKSUM_MISMATCH"},
+        ("pack id does not match", "corrupt", "corruption", "checksum mismatch", "invalid block", "blob corruption"),
+        {"storage", "backup_service"},
     ),
     (
         "network_timeout",
@@ -236,6 +264,9 @@ FAILURE_RULES = [
 EXACT_SIGNAL_WEIGHTS = {
     "QUOTA_EXCEEDED": 0.3,
     "ACCESS_DENIED": 0.3,
+    "CORRUPTION_DETECTED": 0.3,
+    "PACK_ID_MISMATCH": 0.3,
+    "CHECKSUM_MISMATCH": 0.3,
     "ETIMEDOUT": 0.28,
     "ENETUNREACH": 0.28,
     "ECONNRESET": 0.28,
@@ -247,7 +278,151 @@ EXACT_SIGNAL_WEIGHTS = {
 
 
 def _entry_text(entry: TimelineEntryContext) -> str:
-    return f"{entry.component} {entry.error_code or ''} {entry.message}".lower()
+    structured_fields = getattr(entry, "structured_fields", None) or {}
+    structured_bits: list[str] = []
+    for key in (
+        "message_type",
+        "action",
+        "error",
+        "message",
+        "details",
+        "description",
+        "status",
+        "item",
+        "raw_line",
+        "parse_status",
+    ):
+        value = structured_fields.get(key)
+        if isinstance(value, str) and value.strip():
+            structured_bits.append(value)
+    return f"{entry.component} {entry.error_code or ''} {entry.message} {' '.join(structured_bits)}".lower()
+
+
+def _component_key(component: str) -> str:
+    return component.replace("_", "-").strip().lower()
+
+
+def _raw_line_text(entry: TimelineEntryContext) -> str:
+    structured_fields = getattr(entry, "structured_fields", None) or {}
+    raw_line = structured_fields.get("raw_line")
+    if isinstance(raw_line, str) and raw_line.strip():
+        return raw_line.strip()
+    return entry.message.strip()
+
+
+def _has_failure_prefix(entry: TimelineEntryContext) -> bool:
+    text = _raw_line_text(entry)
+    return bool(re.match(r"^\s*(fatal|error|panic)\s*:", text, re.IGNORECASE))
+
+
+def _failure_blob(entries: list[TimelineEntryContext], index: int, radius: int = 1) -> str:
+    start = max(0, index - radius)
+    end = min(len(entries), index + radius + 1)
+    return " ".join(_entry_text(entries[i]) for i in range(start, end))
+
+
+def _mode_from_text(text: str) -> Optional[str]:
+    lowered = text.lower()
+    if any(term in lowered for term in ("no space left on device", "out of space", "disk full", "quota", "capacity", "enospc")):
+        return "quota_exhaustion"
+    if any(term in lowered for term in ("wrong password", "no key found", "access denied", "permission denied", "unauthorized", "forbidden", "authentication failed")):
+        return "permission_failure"
+    if any(term in lowered for term in ("pack id does not match", "checksum mismatch", "corrupt", "corruption", "invalid block", "blob corruption")):
+        return "corruption"
+    if any(term in lowered for term in ("timed out", "timeout", "packet loss", "connection reset", "network unreachable", "unreachable")):
+        return "network_timeout"
+    if any(term in lowered for term in ("service unavailable", "503", "maintenance mode", "dependency outage")):
+        return "service_unavailable"
+    if any(term in lowered for term in ("clock skew", "time skew", "skewed", "ahead of server time")):
+        return "clock_skew"
+    if any(term in lowered for term in ("partial success", "completed with", "3/4", "volumes succeeded")):
+        return "partial_failure"
+    return None
+
+
+def _structured_text(entry: TimelineEntryContext) -> str:
+    structured_fields = getattr(entry, "structured_fields", None) or {}
+    bits: list[str] = []
+    for key in (
+        "message_type",
+        "action",
+        "error",
+        "message",
+        "details",
+        "description",
+        "status",
+        "item",
+        "raw_line",
+        "parse_status",
+    ):
+        value = structured_fields.get(key)
+        if isinstance(value, str) and value.strip():
+            bits.append(value.strip())
+    return " ".join(bits).lower()
+
+
+def _structured_message_type(entry: TimelineEntryContext) -> str:
+    structured_fields = getattr(entry, "structured_fields", None) or {}
+    return str(structured_fields.get("message_type", "")).lower()
+
+
+def _canonical_error_code(entry: TimelineEntryContext) -> Optional[str]:
+    text = _entry_text(entry)
+    structured_text = _structured_text(entry)
+    message_type = _structured_message_type(entry)
+    if message_type not in {"error", "exit_error"} and entry.level != "ERROR":
+        return None
+
+    candidates = [
+        ("QUOTA_EXCEEDED", ("no space left on device", "out of space", "disk full", "quota", "capacity", "enospc")),
+        ("ACCESS_DENIED", ("wrong password", "no key found", "access denied", "permission denied", "unauthorized", "forbidden", "authentication failed")),
+        ("CORRUPTION_DETECTED", ("pack id does not match", "checksum mismatch", "corrupt", "corruption", "integrity", "blob corruption")),
+        ("ETIMEDOUT", ("timed out", "timeout", "network timeout")),
+        ("ECONNRESET", ("connection reset", "reset by peer")),
+        ("ENETUNREACH", ("network unreachable", "unreachable")),
+        ("SERVICE_UNAVAILABLE", ("service unavailable", "503", "maintenance mode", "dependency outage")),
+        ("REQUEST_TIME_TOO_SKEWED", ("clock skew", "time skew", "skewed", "ahead of server time")),
+        ("PARTIAL_SUCCESS", ("partial success", "completed with", "3/4", "volumes succeeded")),
+    ]
+
+    haystack = f"{structured_text} {text}"
+    for code, terms in candidates:
+        if any(term in haystack for term in terms):
+            return code
+    if _has_failure_prefix(entry):
+        return "PLAINTEXT_FATAL"
+    if message_type in {"error", "exit_error"}:
+        return "ERROR"
+    return None
+
+
+def _inferred_failure_mode(
+    entries: list[TimelineEntryContext],
+    index: int,
+) -> Optional[str]:
+    entry = entries[index]
+    canonical = _canonical_error_code(entry)
+    if canonical in {"QUOTA_EXCEEDED"}:
+        return "quota_exhaustion"
+    if canonical in {"ACCESS_DENIED"}:
+        return "permission_failure"
+    if canonical in {"CORRUPTION_DETECTED", "PACK_ID_MISMATCH", "CHECKSUM_MISMATCH"}:
+        return "corruption"
+    if canonical in {"ETIMEDOUT", "ENETUNREACH", "ECONNRESET"}:
+        return "network_timeout"
+    if canonical in {"SERVICE_UNAVAILABLE"}:
+        return "service_unavailable"
+    if canonical in {"REQUEST_TIME_TOO_SKEWED"}:
+        return "clock_skew"
+    if canonical in {"PARTIAL_SUCCESS"}:
+        return "partial_failure"
+    if _has_failure_prefix(entry) or _structured_message_type(entry) in {"error", "exit_error"} or entry.level in {"WARN", "ERROR"}:
+        mode = _mode_from_text(_failure_blob(entries, index, radius=1))
+        if mode:
+            return mode
+        if _has_failure_prefix(entry) or _structured_message_type(entry) in {"error", "exit_error"} or entry.level == "ERROR":
+            return "generic_fatal"
+    return None
 
 
 def _is_terminal_outcome_event(entry: TimelineEntryContext) -> bool:
@@ -255,12 +430,12 @@ def _is_terminal_outcome_event(entry: TimelineEntryContext) -> bool:
     if entry.error_code in TERMINAL_OUTCOME_CODES:
         return True
     return (
-        entry.component == "backup_service"
+        _component_key(entry.component) == "backup-service"
         and ("marked failed" in text or "completed with" in text or "partial_success" in text)
     )
 
 
-def _find_terminal_sequence(entries: list[TimelineEntryContext]) -> int | None:
+def _find_terminal_sequence(entries: list[TimelineEntryContext]) -> Optional[int]:
     terminal_entries = [entry for entry in entries if _is_terminal_outcome_event(entry)]
     if not terminal_entries:
         return None
@@ -278,25 +453,29 @@ def _build_evidence_line(entry: TimelineEntryContext) -> str:
 def _find_matching_entries(
     entries: list[TimelineEntryContext],
     *,
+    mode: str,
     error_codes: set[str],
     message_terms: tuple[str, ...],
-    components: set[str] | None = None,
+    components: Optional[set[str]] = None,
 ) -> list[TimelineEntryContext]:
     matched: list[TimelineEntryContext] = []
-    for entry in entries:
-        text = _entry_text(entry)
+    component_keys = {_component_key(component) for component in components} if components is not None else None
+    for index, entry in enumerate(entries):
+        text = _failure_blob(entries, index, radius=1) if (_has_failure_prefix(entry) or _structured_message_type(entry) in {"error", "exit_error"} or entry.level in {"WARN", "ERROR"}) else _entry_text(entry)
         code_match = entry.error_code in error_codes if entry.error_code else False
         message_match = any(term in text for term in message_terms)
-        component_match = components is None or entry.component in components
-        if component_match and (code_match or message_match):
+        component_match = component_keys is None or _component_key(entry.component) in component_keys
+        inferred_mode = _inferred_failure_mode(entries, index)
+        mode_match = inferred_mode == mode
+        if component_match and (code_match or message_match or mode_match):
             matched.append(entry)
     return matched
 
 
 def _latest_causal_event(
     matches: list[TimelineEntryContext],
-    terminal_sequence: int | None,
-) -> TimelineEntryContext | None:
+    terminal_sequence: Optional[int],
+) -> Optional[TimelineEntryContext]:
     non_terminal = [entry for entry in matches if not _is_terminal_outcome_event(entry)]
     if terminal_sequence is not None:
         before_terminal = [entry for entry in non_terminal if entry.sequence <= terminal_sequence]
@@ -319,11 +498,20 @@ def _rule_match_collections(context: InvestigationContext) -> dict[str, list[Tim
     for mode, codes, terms, components in FAILURE_RULES:
         collections[mode] = _find_matching_entries(
             entries,
+            mode=mode,
             error_codes=codes,
             message_terms=terms,
             components=components,
         )
     return collections
+
+
+def _fatal_fallback_entries(entries: list[TimelineEntryContext]) -> list[TimelineEntryContext]:
+    return [
+        entry
+        for entry in entries
+        if _has_failure_prefix(entry) or entry.error_code in {"PLAINTEXT_FATAL", "RAW_UNPARSED"} and entry.level == "ERROR"
+    ]
 
 
 def _classify_failure_mode(
@@ -363,10 +551,133 @@ def _classify_failure_mode(
             best_matches = matches
             best_score = score
 
+    if best_mode == "unknown":
+        fatal_entries = _fatal_fallback_entries(entries)
+        if fatal_entries:
+            best_mode = "generic_fatal"
+            best_matches = fatal_entries
+            best_score = len(fatal_entries)
+            rule_scores["generic_fatal"] = best_score
+
     return best_mode, best_matches, collections, rule_scores
 
 
+def _evidence_grounded_actions(
+    mode: str, matched_entries: list[TimelineEntryContext]
+) -> list[str]:
+    """Generate actions grounded in actual evidence from matched entries, augmented by failure mode."""
+    
+    # Always use mode-specific actions as baseline, then enhance with evidence-specific details
+    # This ensures partial_failure gets partial_failure actions, not just network actions
+    
+    mode_specific_actions = {
+        "quota_exhaustion": [
+            "Increase destination storage capacity or prune old backup artifacts before the next run.",
+            "Trigger proactive quota alerts earlier so backup jobs are blocked before upload begins.",
+            "Mark quota-exceeded failures as non-transient and skip retry loops until capacity is restored.",
+        ],
+        "permission_failure": [
+            "Restore read permissions for the backup service principal on the affected storage path.",
+            "Audit the recent policy change and roll back least-privilege scope reductions that removed required actions.",
+            "Add a preflight authorization check before restore jobs start.",
+        ],
+        "network_timeout": [
+            "Stabilize the failing network path (tunnel flap/packet loss) before rerunning the restore.",
+            "Tune timeout and retry policies for intermittent transport instability.",
+            "Add targeted alerts for ETIMEDOUT/ENETUNREACH/ECONNRESET spikes on backup traffic.",
+        ],
+        "service_unavailable": [
+            "Coordinate with the dependency owner to schedule maintenance windows outside backup execution.",
+            "Keep backoff-retry behavior for transient 503 outages and alert when outage duration exceeds retry budget.",
+            "Add dependency health prechecks before starting large upload phases.",
+        ],
+        "clock_skew": [
+            "Repair host time synchronization (NTP) on the backup nodes before the next signed request.",
+            "Add clock-skew drift alerts with thresholds below the storage signature tolerance window.",
+            "Force a time-sync validation precheck before backup upload signing.",
+        ],
+        "partial_failure": [
+            "Isolate failed child tasks and re-run only the failed volumes instead of the entire job.",
+            "Track per-task success/failure metrics so partial outcomes trigger explicit remediation workflows.",
+            "Review whether child task failures are related to resource contention or environmental issues.",
+        ],
+        "corruption": [
+            "Verify repository integrity and repair or recreate corrupted packs before rerunning the job.",
+            "Check for disk or storage path issues that may be truncating writes or corrupting blob data.",
+            "Add integrity checks earlier so corruption is surfaced before the terminal backup step.",
+        ],
+        "generic_fatal": [
+            "Inspect the fatal line together with the immediately surrounding log lines for the missing failure family.",
+            "Preserve raw restic stderr/plaintext output so generic fatal lines are not lost during normalization.",
+            "Add richer fatal-line heuristics for unknown-but-failing events.",
+        ],
+    }
+    
+    # If we have mode-specific actions, start with those
+    if mode in mode_specific_actions:
+        return mode_specific_actions[mode]
+    
+    # Fallback for unknown modes: use evidence-grounded detection
+    evidence_text = " ".join(_entry_text(entry).lower() for entry in matched_entries)
+    error_codes = {(entry.error_code or "").lower() for entry in matched_entries}
+    
+    # Check for specific symptoms
+    has_quota = any(
+        phrase in evidence_text
+        for phrase in ["quota", "space", "capacity", "disk full", "no space left", "enospc"]
+    ) or "quota_exceeded" in error_codes or "quota_warning" in error_codes
+    
+    has_oom = any(
+        phrase in evidence_text
+        for phrase in ["oom", "out of memory", "memory exhaustion", "sigkill", "memory watchdog"]
+    )
+    
+    has_corruption = any(
+        phrase in evidence_text
+        for phrase in ["corrupt", "checksum", "pack id", "blob", "integrity", "mismatch"]
+    ) or any(code in error_codes for code in ["corruption_detected", "pack_id_mismatch", "checksum_mismatch"])
+    
+    has_auth = (
+        "access_denied" in error_codes
+        or "permission_denied" in error_codes
+        or "unauthorized" in error_codes
+        or any(
+            phrase in evidence_text
+            for phrase in ["permission denied", "access denied", "authentication failed", "wrong password", "no key found", "principal lacks", "lacks ", "scope narrowed"]
+        )
+    )
+    
+    has_network = any(
+        phrase in evidence_text
+        for phrase in ["etimedout", "enetunreach", "econnreset", "packet loss", "connection reset", "tunnel"]
+    ) or any(code in error_codes for code in ["etimedout", "enetunreach", "econnreset"])
+    
+    # For unknown modes, check symptoms in order of priority
+    if has_quota:
+        return mode_specific_actions["quota_exhaustion"]
+    if has_corruption:
+        return mode_specific_actions["corruption"]
+    if has_oom:
+        return [
+            "Review memory allocation and limits for backup worker processes — consider increasing heap/RSS caps or reducing concurrent job parallelism.",
+            "Enable memory pressure monitoring with earlier warnings before OOM conditions trigger system watchdogs.",
+            "Profile peak memory usage during large data scans to establish resource requirements.",
+        ]
+    if has_auth:
+        return mode_specific_actions["permission_failure"]
+    if has_network:
+        return mode_specific_actions["network_timeout"]
+    
+    # Generic fallback for truly unknown modes
+    return [
+        "Review the most recent non-terminal error event and its upstream dependencies.",
+        "Add targeted alerts around repeated WARN/ERROR patterns preceding terminal job outcomes.",
+        "Capture richer component diagnostics at failure boundaries to improve deterministic classification.",
+    ]
+
+
 def _scenario_specific_actions(mode: str) -> list[str]:
+    """Legacy template-based actions. Use _evidence_grounded_actions instead."""
     if mode == "quota_exhaustion":
         return [
             "Increase destination storage capacity or prune old backup artifacts before the next run.",
@@ -403,6 +714,18 @@ def _scenario_specific_actions(mode: str) -> list[str]:
             "Review non-retryable network reset policy for hard connection resets on parallel task workers.",
             "Track per-task success/failure metrics so partial outcomes trigger explicit remediation workflows.",
         ]
+    if mode == "corruption":
+        return [
+            "Verify repository integrity and repair or recreate corrupted packs before rerunning the job.",
+            "Check for disk or storage path issues that may be truncating writes or corrupting blob data.",
+            "Add integrity checks earlier so corruption is surfaced before the terminal backup step.",
+        ]
+    if mode == "generic_fatal":
+        return [
+            "Inspect the fatal line together with the immediately surrounding log lines for the missing failure family.",
+            "Preserve raw restic stderr/plaintext output so generic fatal lines are not lost during normalization.",
+            "Add richer fatal-line heuristics for unknown-but-failing events.",
+        ]
     return [
         "Review the most recent non-terminal error event and its upstream dependencies.",
         "Add targeted alerts around repeated WARN/ERROR patterns preceding terminal job outcomes.",
@@ -410,7 +733,7 @@ def _scenario_specific_actions(mode: str) -> list[str]:
     ]
 
 
-def _root_cause_text(mode: str, causal_event: TimelineEntryContext | None) -> str:
+def _root_cause_text(mode: str, causal_event: Optional[TimelineEntryContext]) -> str:
     event_detail = ""
     if causal_event is not None:
         code = causal_event.error_code or "NO_CODE"
@@ -447,6 +770,19 @@ def _root_cause_text(mode: str, causal_event: TimelineEntryContext | None) -> st
             "Parallel volume processing ended in partial failure: at least one child task failed while others succeeded."
             + event_detail
         )
+    if mode == "corruption":
+        return (
+            "Repository or blob corruption was detected, preventing the backup from completing successfully."
+            + event_detail
+        )
+    if mode == "generic_fatal":
+        if causal_event is not None:
+            fatal_text = _raw_line_text(causal_event)
+            return f"A fatal error interrupted processing: {fatal_text}" + event_detail
+        return (
+            "A fatal error interrupted processing before a more specific failure family could be determined."
+            + event_detail
+        )
     return "The timeline shows repeated error activity preceding the final job outcome, but the dominant failure class is inconclusive."
 
 
@@ -458,6 +794,16 @@ def _family_consistency_ratio(
    if total_classified == 0:
        return 0.0
    return len(best_matches) / total_classified
+
+
+def _supports_corroboration(entry: TimelineEntryContext) -> bool:
+   if entry.level in {"WARN", "ERROR"}:
+       return True
+   if _has_failure_prefix(entry):
+       return True
+   if entry.error_code in {"PLAINTEXT_FATAL", "RAW_UNPARSED"} and _raw_line_text(entry).lower().startswith(("fatal:", "error:", "panic:")):
+       return True
+   return False
 
 
 def _temporal_chain_strength(
@@ -485,7 +831,7 @@ def _compute_confidence(
    *,
    mode: str,
    matched_entries: list[TimelineEntryContext],
-   causal_event: TimelineEntryContext | None,
+   causal_event: Optional[TimelineEntryContext],
    all_collections: dict[str, list[TimelineEntryContext]],
    rule_scores: dict[str, int],
    terminal_entries: list[TimelineEntryContext],
@@ -500,20 +846,25 @@ def _compute_confidence(
    explanation: list[str] = []
 
    if causal_event is not None and not _is_terminal_outcome_event(causal_event):
-       if causal_event.error_code in EXACT_SIGNAL_WEIGHTS:
-           breakdown["causal_signal"] = EXACT_SIGNAL_WEIGHTS[causal_event.error_code]
+       canonical_error_code = _canonical_error_code(causal_event) or causal_event.error_code
+       if canonical_error_code in EXACT_SIGNAL_WEIGHTS:
+           breakdown["causal_signal"] = EXACT_SIGNAL_WEIGHTS[canonical_error_code]
            explanation.append("✓ Exact causal error identified")
+       elif _structured_message_type(causal_event) in {"error", "exit_error"}:
+           breakdown["causal_signal"] = 0.16
+           explanation.append("✓ Structured causal error identified")
        elif causal_event.level == "ERROR":
            breakdown["causal_signal"] = 0.16
            explanation.append("✓ Non-terminal causal error identified")
-   elif matched_entries and any(entry.error_code in EXACT_SIGNAL_WEIGHTS for entry in matched_entries):
+   elif matched_entries and any((_canonical_error_code(entry) or entry.error_code) in EXACT_SIGNAL_WEIGHTS for entry in matched_entries):
        breakdown["causal_signal"] = 0.12
        explanation.append("• Failure family identified, but the precise causal event is less direct")
    elif terminal_entries:
        breakdown["causal_signal"] = 0.04
        explanation.append("• Only terminal outcome evidence is available")
 
-   unique_components = {entry.component for entry in matched_entries}
+   corroborating_entries = [entry for entry in matched_entries if _supports_corroboration(entry)]
+   unique_components = {_component_key(entry.component) for entry in corroborating_entries}
    corroborating_components = min(len(unique_components), 3)
    if corroborating_components >= 3:
        breakdown["corroboration"] = 0.22
@@ -521,7 +872,7 @@ def _compute_confidence(
    elif corroborating_components == 2:
        breakdown["corroboration"] = 0.14
        explanation.append("✓ Evidence is corroborated by more than one component")
-   elif corroborating_components == 1 and matched_entries:
+   elif corroborating_components == 1 and corroborating_entries:
        breakdown["corroboration"] = 0.05
        explanation.append("• Most evidence comes from a single component")
 
@@ -602,7 +953,7 @@ def _generate_fallback_summary(context: InvestigationContext) -> InvestigationSu
     return InvestigationSummary(
         likely_root_cause=_root_cause_text(mode, causal_event),
         supporting_evidence=evidence[:5],
-        next_actions=_scenario_specific_actions(mode),
+        next_actions=_evidence_grounded_actions(mode, matched_entries),
         confidence=confidence,
         confidence_breakdown=confidence_breakdown,
         confidence_explanation=confidence_explanation,
@@ -631,7 +982,7 @@ def generate_live_investigation_summary(
     context: InvestigationContext,
     model: str = "gpt-4.1-mini",
     timeout_seconds: float = DEFAULT_OPENAI_TIMEOUT_SECONDS,
-) -> tuple[InvestigationSummary, bool, str | None]:
+) -> tuple[InvestigationSummary, bool, Optional[str]]:
     try:
         return (
             generate_llm_investigation_summary(

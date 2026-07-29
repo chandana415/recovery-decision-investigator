@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 from recovery_workspace.events import normalize_events
 from recovery_workspace.models import Event, LogEntry, Scenario
@@ -23,6 +23,6 @@ def parse_events(raw_logs: list[dict[str, Any]]) -> list[Event]:
     return normalize_events(parse_logs(raw_logs))
 
 
-def parse_scenario(path: str | Path) -> Scenario:
+def parse_scenario(path: Union[str, Path]) -> Scenario:
     raw = json.loads(Path(path).read_text())
     return Scenario.model_validate(raw)

@@ -407,7 +407,7 @@ def _make_context(
     )
 
 
-def _entry(sequence, component, level, error_code, message):
+def _entry(sequence, component, level, error_code, message, structured_fields=None):
     return TimelineEntryContext(
         sequence=sequence,
         timestamp=f"2026-07-01T00:00:0{sequence}Z",
@@ -416,6 +416,7 @@ def _entry(sequence, component, level, error_code, message):
         error_code=error_code,
         message=message,
         gap_before_seconds=1.0 if sequence > 1 else 0.0,
+        structured_fields=structured_fields or {},
     )
 
 
@@ -555,6 +556,138 @@ def test_complete_causal_chain_produces_high_confidence():
     summary = generate_simulated_investigation_summary(context)
 
     assert summary.confidence >= 0.75
+
+
+def test_structured_error_fields_raise_causal_signal_and_corroboration():
+    context = _make_context(
+        [
+            _entry(1, "monitoring", "WARN", None, "storage volume at 92% capacity"),
+            _entry(
+                2,
+                "storage",
+                "ERROR",
+                None,
+                "verbose_status",
+                structured_fields={
+                    "message_type": "error",
+                    "error": "unable to save blob: no space left on device",
+                    "message": "unable to save blob: no space left on device",
+                },
+            ),
+            _entry(3, "backup_service", "ERROR", "JOB_FAILED", "job marked failed"),
+        ],
+        warning_events=[
+            EventContext(
+                timestamp="2026-07-01T00:00:01Z",
+                component="monitoring",
+                level="WARN",
+                error_code=None,
+                message="storage volume at 92% capacity",
+                structured_fields={},
+            )
+        ],
+    )
+
+    summary = generate_simulated_investigation_summary(context)
+
+    assert summary.confidence_breakdown["causal_signal"] >= 0.3
+    assert summary.confidence_breakdown["corroboration"] >= 0.14
+    assert "quota" in summary.likely_root_cause.lower() or "capacity" in summary.likely_root_cause.lower()
+
+
+def test_raw_plaintext_failure_lines_contribute_to_causal_signal():
+    context = _make_context(
+        [
+            _entry(1, "monitoring", "WARN", None, "storage volume at 92% capacity"),
+            _entry(
+                2,
+                "backup_service",
+                "ERROR",
+                "PLAINTEXT_FATAL",
+                "Fatal: unable to save snapshot: write /repo/data/...: no space left on device",
+                structured_fields={
+                    "raw_line": "Fatal: unable to save snapshot: write /repo/data/...: no space left on device",
+                    "parse_status": "fatal_plaintext",
+                },
+            ),
+            _entry(3, "backup_service", "ERROR", "JOB_FAILED", "job marked failed"),
+        ],
+        warning_events=[
+            EventContext(
+                timestamp="2026-07-01T00:00:01Z",
+                component="monitoring",
+                level="WARN",
+                error_code=None,
+                message="storage volume at 92% capacity",
+                structured_fields={},
+            )
+        ],
+    )
+
+    summary = generate_simulated_investigation_summary(context)
+
+    assert summary.confidence_breakdown["causal_signal"] >= 0.3
+    assert summary.confidence > 0.3
+    assert "quota" in summary.likely_root_cause.lower() or "capacity" in summary.likely_root_cause.lower()
+
+
+def test_generic_fatal_line_uses_neighboring_context_for_family_detection():
+    context = _make_context(
+        [
+            _entry(1, "storage", "WARN", None, "storage volume at 92% capacity"),
+            _entry(
+                2,
+                "backup_service",
+                "ERROR",
+                "PLAINTEXT_FATAL",
+                "Fatal: unable to save snapshot",
+                structured_fields={
+                    "raw_line": "Fatal: unable to save snapshot",
+                    "parse_status": "fatal_plaintext",
+                },
+            ),
+            _entry(3, "backup_service", "ERROR", "JOB_FAILED", "job marked failed"),
+        ],
+        warning_events=[
+            EventContext(
+                timestamp="2026-07-01T00:00:01Z",
+                component="storage",
+                level="WARN",
+                error_code=None,
+                message="storage volume at 92% capacity",
+                structured_fields={},
+            )
+        ],
+    )
+
+    summary = generate_simulated_investigation_summary(context)
+
+    assert summary.confidence_breakdown["causal_signal"] >= 0.16
+    assert "quota" in summary.likely_root_cause.lower() or "capacity" in summary.likely_root_cause.lower()
+
+
+def test_routine_non_alarm_line_does_not_count_as_corroboration():
+    context = _make_context(
+        [
+            _entry(
+                1,
+                "backup_service",
+                "ERROR",
+                "PLAINTEXT_FATAL",
+                "Fatal: unable to save snapshot",
+                structured_fields={
+                    "raw_line": "Fatal: unable to save snapshot",
+                    "parse_status": "fatal_plaintext",
+                },
+            ),
+            _entry(2, "storage", "INFO", None, "nightly integrity scan started"),
+            _entry(3, "backup_service", "ERROR", "JOB_FAILED", "job marked failed"),
+        ]
+    )
+
+    summary = generate_simulated_investigation_summary(context)
+
+    assert summary.confidence_breakdown["corroboration"] <= 0.05
 
 
 def test_confidence_scores_are_deterministic_and_bounded():

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -13,23 +13,27 @@ class LogEntry(BaseModel):
 
     timestamp: datetime
     correlation_id: str = Field(alias="correlationId")
-    trace_id: str | None = Field(default=None, alias="traceId")
+    trace_id: Optional[str] = Field(default=None, alias="traceId")
     component_id: str = Field(alias="componentId")
     component: str
     level: LogLevel
-    error_code: str | None = Field(alias="errorCode")
+    error_code: Optional[str] = Field(default=None, alias="errorCode")
     message: str
+    source_file: Optional[str] = Field(default=None)
+    structured_fields: dict[str, Any] = Field(default_factory=dict, alias="structuredFields")
 
 
 class Event(BaseModel):
     timestamp: datetime
     correlation_id: str
-    trace_id: str | None = None
+    trace_id: Optional[str] = None
     component_id: str
     component: str
     level: LogLevel
-    error_code: str | None
+    error_code: Optional[str]
     message: str
+    source_file: Optional[str] = None
+    structured_fields: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
     def from_log_entry(cls, log: LogEntry) -> "Event":
@@ -42,6 +46,8 @@ class Event(BaseModel):
             level=log.level,
             error_code=log.error_code,
             message=log.message,
+            source_file=log.source_file,
+            structured_fields=log.structured_fields,
         )
 
 
@@ -64,17 +70,19 @@ class TimelineEntryContext(BaseModel):
     timestamp: str
     component: str
     level: LogLevel
-    error_code: str | None = None
+    error_code: Optional[str] = None
     message: str
     gap_before_seconds: float
+    structured_fields: dict[str, Any] = Field(default_factory=dict)
 
 
 class EventContext(BaseModel):
     timestamp: str
     component: str
     level: LogLevel
-    error_code: str | None = None
+    error_code: Optional[str] = None
     message: str
+    structured_fields: dict[str, Any] = Field(default_factory=dict)
 
 
 class InvestigationContext(BaseModel):

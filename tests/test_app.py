@@ -14,9 +14,16 @@ from recovery_workspace.app import (
     load_scenario_entries,
     load_scenarios_index,
     run_analysis,
+    select_investigation_evidence,
     split_root_cause_text,
     summarize_causal_event,
 )
+from recovery_workspace.app import build_uploaded_scenario
+from recovery_workspace.events import normalize_events
+from recovery_workspace.investigation import build_investigation_context
+from recovery_workspace.parser import parse_scenario
+from recovery_workspace.timeline import build_timeline
+from recovery_workspace.uploader import parse_uploaded_logs_with_source
 from recovery_workspace.models import InvestigationSummary
 
 
@@ -192,19 +199,89 @@ def test_primary_causal_event_display_is_humanized():
 def test_evidence_timeline_items_are_chronological_and_unique():
     entry = load_scenario_entries()[0]
     _, timeline, context, _ = load_processed_scenario(entry["path"])
+    evidence = select_investigation_evidence(context)
+    items = evidence_timeline_items(evidence)
+
+    labels = [item["stage"] for item in items]
+    assert len(items) == len({item["event_id"] for item in items})
+    assert any("Primary Failure" in label for label in labels)
+    assert any("Outcome" in label for label in labels)
+    assert {item["event_id"] for item in items} == {item.event_id for item in evidence.causal_chain}
+
+
+def test_shared_evidence_model_preserves_lock_refresh_chain():
+    content = """2026-08-02T14:00:00Z backup-service backup-service INFO repository opened successfully
+source file could not be accessed because another process was using it
+2026-08-02T14:00:02Z backup-service backup-service ERROR failed to refresh lock in time
+2026-08-02T14:00:02Z backup-service backup-service ERROR failed to refresh lock in time
+progress 50% complete
+2026-08-02T14:00:03Z backup-service backup-service ERROR unable to save snapshot: context canceled
+"""
+    logs, error = parse_uploaded_logs_with_source(content, "backup-service.log")
+    assert error == ""
+    scenario = build_uploaded_scenario(["backup-service.log"], logs)
+    events = normalize_events(scenario.logs)
+    timeline = build_timeline(events)
+    context = build_investigation_context(
+        customer=scenario.customer,
+        job_id=scenario.job_id,
+        outcome=scenario.expected_outcome,
+        expected_failure_signature=scenario.expected_failure_signature,
+        timeline=timeline,
+        events=events,
+    )
+    evidence = select_investigation_evidence(context)
     summary, _, _, _ = run_analysis(
         context,
         analysis_mode="Simulated",
         should_generate_live=False,
+        evidence=evidence,
     )
-    _, causal_event_text = split_root_cause_text(summary.likely_root_cause)
 
-    items = evidence_timeline_items(timeline, causal_event_text)
+    assert summary.evidence is not None
+    timeline_ids = [item["event_id"] for item in evidence_timeline_items(evidence)]
+    finding_ids = [item.event_id for item in summary.evidence.causal_chain]
+    assert summary.evidence.primary_causal_event is not None
+    assert summary.evidence.primary_causal_event.role == "PRIMARY_CAUSE"
+    assert summary.evidence.primary_causal_event.event_id in timeline_ids
+    assert timeline_ids == finding_ids
+    assert len(finding_ids) == len(set(finding_ids))
+    assert any(item["time"] == "Timestamp unavailable" for item in evidence_timeline_items(evidence))
+    assert all("progress" not in item["summary"].lower() for item in evidence_timeline_items(evidence))
+    assert summary.evidence.primary_causal_event.summary is not None
 
-    labels = [item["stage"] for item in items]
-    assert len(items) == len({(item["stage"], item["time"], item["summary"]) for item in items})
-    assert any("Primary Failure" in label for label in labels)
-    assert any("Outcome" in label for label in labels)
+
+def test_evidence_timeline_uses_human_readable_display_fields():
+    content = """2026-08-02T14:00:00Z backupservice backupservice INFO repository opened successfully
+source file could not be accessed because another process was using it
+2026-08-02T14:00:02Z backupservice backupservice ERROR failed to refresh lock in time
+2026-08-02T14:00:03Z backupservice backupservice ERROR unable to save snapshot: context canceled
+"""
+    logs, error = parse_uploaded_logs_with_source(content, "backupservice.log")
+    assert error == ""
+    scenario = build_uploaded_scenario(["backupservice.log"], logs)
+    events = normalize_events(scenario.logs)
+    timeline = build_timeline(events)
+    context = build_investigation_context(
+        customer=scenario.customer,
+        job_id=scenario.job_id,
+        outcome=scenario.expected_outcome,
+        expected_failure_signature=scenario.expected_failure_signature,
+        timeline=timeline,
+        events=events,
+    )
+    evidence = select_investigation_evidence(context)
+    items = evidence_timeline_items(evidence)
+
+    joined_text = " ".join(
+        f"{item['display_summary']} {item['display_detail']} {item['detail']}" for item in items
+    ).upper()
+    assert "PLAINTEXT_FATAL" not in joined_text
+    assert "RAW_UNPARSED" not in joined_text
+    assert "NO_CODE" not in joined_text
+    assert len({item["display_summary"] for item in items}) == len(items)
+    assert items[-2]["display_summary"] != items[-1]["display_summary"]
+    assert all(item["display_detail"] for item in items)
 
 
 def test_format_event_timestamp_returns_full_utc_timestamp():
@@ -228,6 +305,7 @@ def test_developer_diagnostics_hidden_by_default():
         enabled=False,
         scenario=scenario,
         selected_entry=entry,
+        scenario_path=str(entry["path"]),
         timings={"total_page_execution": 0.1},
         timeline=timeline,
     )
@@ -243,6 +321,7 @@ def test_developer_diagnostics_include_expected_failure_signature_when_enabled()
         enabled=True,
         scenario=scenario,
         selected_entry=entry,
+        scenario_path=str(entry["path"]),
         timings={"total_page_execution": 0.1},
         timeline=timeline,
     )
@@ -251,3 +330,4 @@ def test_developer_diagnostics_include_expected_failure_signature_when_enabled()
     assert payload["Expected failure signature"] == scenario.expected_failure_signature
     assert payload["Scenario ID"] == scenario.scenario_id
     assert "Execution timings" in payload
+    assert any("message" in event and event["message"] for event in payload["Raw event payloads"])

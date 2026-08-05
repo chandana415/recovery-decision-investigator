@@ -10,6 +10,8 @@ import pytest
 
 from recovery_workspace.models import LogEntry
 from recovery_workspace.uploader import (
+    detect_document_type,
+    detect_input_structure,
     parse_uploaded_logs,
     parse_uploaded_logs_with_source,
     read_uploaded_file_safe,
@@ -249,3 +251,143 @@ not-json-but-visible
     assert any(entry.error_code == "RAW_UNPARSED" for entry in parsed)
     assert any("no space left on device" in entry.message.lower() for entry in parsed)
     assert any(entry.message == "not-json-but-visible" for entry in parsed)
+
+
+def test_parse_uploaded_logs_parses_key_value_plaintext_blocks():
+    content = '''time="2026-07-29T15:23:07.000Z" level=ERROR msg="snapshot failed" cause="permission denied" source="/data/backup" stack="trace line 1"'''
+
+    parsed, err = parse_uploaded_logs_with_source(content, "backup.log")
+    assert err == ""
+    assert parsed is not None
+    assert len(parsed) == 1
+    entry = parsed[0]
+    assert entry.timestamp is not None
+    assert entry.level == "ERROR"
+    assert entry.message == "snapshot failed"
+    assert entry.structured_fields["cause"] == "permission denied"
+    assert entry.structured_fields["source"] == "/data/backup"
+    assert entry.structured_fields["stack"] == "trace line 1"
+    assert entry.structured_fields["raw_line"].startswith("time=")
+
+
+def test_parse_uploaded_logs_falls_back_to_generic_plaintext_lines():
+    content = "monitoring: snapshot failed\nbackup_service: retrying"
+
+    parsed, err = parse_uploaded_logs_with_source(content, "monitoring.log")
+    assert err == ""
+    assert parsed is not None
+    assert len(parsed) == 2
+    assert any(entry.component == "monitoring" and entry.level == "ERROR" for entry in parsed)
+    assert any(entry.component == "backup-service" and entry.message == "retrying" for entry in parsed)
+
+
+def test_parse_uploaded_logs_handles_timestamped_component_level_messages():
+    content = "2026-07-29T15:23:07.000Z monitoring ERROR snapshot failed\n2026-07-29T15:24:07.000Z backup_service WARN retrying"
+
+    parsed, err = parse_uploaded_logs_with_source(content, "monitoring.log")
+    assert err == ""
+    assert parsed is not None
+    assert len(parsed) == 2
+    assert any(entry.component == "monitoring" and entry.message == "snapshot failed" for entry in parsed)
+    assert any(entry.component == "backup-service" and entry.level == "WARN" for entry in parsed)
+
+
+def test_parse_uploaded_logs_handles_ceph_command_output():
+    content = "[ceph@mon1 ~]$ ceph -s\nhealth HEALTH_ERR\n64 pgs degraded\n[ceph@mon1 ~]$ ceph osd tree"
+
+    parsed, err = parse_uploaded_logs_with_source(content, "monitoring.log")
+    assert err == ""
+    assert parsed is not None
+    assert any(entry.message == "health HEALTH_ERR" and entry.level == "ERROR" for entry in parsed)
+    assert any("pgs degraded" in entry.message for entry in parsed)
+
+
+def test_parse_uploaded_logs_parses_tabular_event_output():
+    content = '''
+first_seen           last_seen           count source reason message
+2026-01-01T00:00:00Z 2026-01-01T00:00:05Z 1 storage scheduled backup started
+2026-01-01T00:01:00Z 2026-01-01T00:01:00Z 1 backup-service failure job failed
+'''.strip()
+
+    parsed, err = parse_uploaded_logs_with_source(content, "events.log")
+    assert err == ""
+    assert parsed is not None
+    assert len(parsed) == 2
+    assert any(entry.level == "INFO" for entry in parsed)
+    assert any(entry.level == "ERROR" for entry in parsed)
+    assert any(entry.structured_fields.get("count") == 1 for entry in parsed)
+    assert any(entry.structured_fields.get("source") == "backup-service" for entry in parsed)
+    assert any(entry.structured_fields.get("reason") == "failure" for entry in parsed)
+
+
+def test_parse_uploaded_logs_parses_command_status_blocks_without_commands_as_events():
+    content = '''
+$ ./health-check.sh
+section=cluster
+state=degraded
+entity_id=node-7
+count=2
+available=1
+summary=one node down
+'''.strip()
+
+    parsed, err = parse_uploaded_logs_with_source(content, "status.log")
+    assert err == ""
+    assert parsed is not None
+    assert not any(entry.message == "$ ./health-check.sh" for entry in parsed)
+    assert any(entry.structured_fields.get("state") == "degraded" for entry in parsed)
+    assert any(entry.structured_fields.get("count") == 2 for entry in parsed)
+    assert any(entry.structured_fields.get("available") == 1 for entry in parsed)
+
+
+def test_detect_input_structure_rejects_address_like_key_values():
+    content = '''
+mon1=10.0.0.1:6789/0
+mon2=10.0.0.2:6789/0
+status=active
+'''.strip()
+
+    parser_name, metadata = detect_input_structure(content, "status.log")
+    assert parser_name != "key_value"
+    assert metadata["confidence"] <= 0.6
+
+
+def test_detect_input_structure_prefers_command_status_for_status_blocks():
+    content = '''
+$ ./health-check.sh
+section=cluster
+state=degraded
+entity_id=node-7
+count=2
+available=1
+summary=one node down
+'''.strip()
+
+    parser_name, metadata = detect_input_structure(content, "status.log")
+    assert parser_name == "command_status"
+    assert metadata["confidence"] >= 0.6
+
+
+def test_detect_document_type_recognizes_ocr_degraded_exception_documents():
+    content = '''
+Error : unable to complete backup
+level : ERROR
+logger : org sp ring framework web client RestClientException
+message : request failed
+thread : main
+throwable : com ex ample service BackupException
+cause : io netty handler timeout
+stack : at com ex ample service BackupService runBackup (BackupService java : 42)
+at com ex ample service BackupService retry (BackupService java : 88)
+at com ex ample service BackupService execute (BackupService java : 103)
+suppressed : java lang RuntimeException: retry interrupted
+'''.strip()
+
+    assert detect_document_type(content, "ocr.log") == "EXCEPTION_DOCUMENT"
+
+    parsed, err = parse_uploaded_logs_with_source(content, "ocr.log")
+    assert err == ""
+    assert parsed is not None
+    assert len(parsed) == 1
+    assert parsed[0].level == "ERROR"
+    assert "unable to complete backup" in parsed[0].message

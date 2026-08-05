@@ -14,10 +14,12 @@ import streamlit as st
 from recovery_workspace.events import normalize_events
 from recovery_workspace.investigation import (
     build_investigation_context,
+    build_investigation_report_view,
     generate_llm_investigation_summary,
     generate_simulated_investigation_summary,
+    select_investigation_evidence,
 )
-from recovery_workspace.models import Scenario, LogEntry
+from recovery_workspace.models import Scenario, LogEntry, InvestigationEvidence
 from recovery_workspace.parser import parse_scenario
 from recovery_workspace.timeline import build_timeline
 from recovery_workspace.uploader import (
@@ -240,6 +242,12 @@ def format_component_name(component_id: Optional[str]) -> str:
     return normalized.title()
 
 
+def _evidence_timestamp_display(item) -> str:
+    if not item.timestamp or item.timestamp_source not in {"available", "parsed"}:
+        return "Timestamp unavailable"
+    return format_event_timestamp(item.timestamp)
+
+
 def split_root_cause_text(text: str) -> tuple[str, Optional[str]]:
     marker = " Most likely causal event: "
     if marker not in text:
@@ -332,47 +340,34 @@ def format_event_timestamp(
     return utc_time.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def evidence_timeline_items(timeline, causal_event_text: Optional[str]) -> list[dict[str, str]]:
-    causal_sequence = causal_event_sequence(timeline, causal_event_text)
-    outcome_sequence = terminal_outcome_sequence(timeline)
-    selected_sequences: set[int] = set()
-
-    for entry in timeline.entries:
-        if entry.event.level == "WARN":
-            selected_sequences.add(entry.sequence)
-    if causal_sequence is not None:
-        selected_sequences.add(causal_sequence)
-    if outcome_sequence is not None:
-        selected_sequences.add(outcome_sequence)
-
-    if not selected_sequences and timeline.entries:
-        selected_sequences.add(timeline.entries[-1].sequence)
-
+def evidence_timeline_items(evidence: InvestigationEvidence) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
-    for entry in timeline.entries:
-        if entry.sequence not in selected_sequences:
-            continue
-        if entry.sequence == causal_sequence:
+    for item in evidence.causal_chain:
+        if item.role == "PRIMARY_CAUSE":
             stage = "❌ Primary Failure"
-        elif entry.sequence == outcome_sequence:
+        elif item.role == "OUTCOME":
             stage = "Outcome"
-        elif entry.event.level == "WARN":
-            stage = "⚠️ Monitoring Warning"
+        elif item.role == "CONTRIBUTING":
+            stage = "⚠️ Contributing Evidence"
+        elif item.role == "PROPAGATION":
+            stage = "Propagation"
         else:
             stage = "Evidence"
 
-        code = entry.event.error_code or "NO_CODE"
-        timestamp_iso = to_iso_utc(entry.event.timestamp.isoformat())
         items.append(
             {
                 "stage": stage,
-                "timestamp_iso": timestamp_iso,
-                "time": format_event_timestamp(timestamp_iso),
-                "summary": f"{entry.event.component} {code}",
-                "detail": entry.event.message,
-                "source": format_component_source(entry.event.component),
-                "component_id": entry.event.component_id,
-                "component_name": format_component_name(entry.event.component_id),
+                "timestamp": item.timestamp or "",
+                "time": _evidence_timestamp_display(item),
+                "display_summary": item.display_summary or item.summary or item.message,
+                "display_detail": item.display_detail or item.summary or item.message,
+                "summary": item.display_summary or item.summary or item.message,
+                "detail": item.display_detail or item.summary or item.message,
+                "source": format_component_source(item.component),
+                "component_id": item.component,
+                "component_name": format_component_name(item.source_file or item.component),
+                "role": item.role,
+                "event_id": item.event_id,
             }
         )
     return items
@@ -447,15 +442,17 @@ def root_cause_reason(summary_explanations: list[str]) -> str:
     return "Evidence is chronologically consistent and no conflicting signals were detected."
 
 
-def confidence_reason_lines(timeline, summary_explanations: list[str]) -> tuple[list[str], str]:
+def confidence_reason_lines(evidence: InvestigationEvidence) -> tuple[list[str], str]:
     preferred = ["monitoring", "backup_service", "storage", "network", "auth", "encryption"]
-    available = {normalize_component_key(entry.event.component) for entry in timeline.entries}
+    available = {normalize_component_key(item.component) for item in evidence.causal_chain}
     ordered = [component for component in preferred if normalize_component_key(component) in available]
     if not ordered:
         ordered = sorted(available)
     lines = [f"{format_component_source(component)} events" for component in ordered[:3]]
     conclusion = "All available evidence supported the same causal sequence."
-    if any("No competing" in line for line in summary_explanations):
+    if evidence.limitations:
+        conclusion += " " + evidence.limitations[0]
+    if evidence.confidence_explanation and any("No competing" in line for line in evidence.confidence_explanation):
         conclusion += " No conflicting evidence was detected."
     return lines, conclusion
 
@@ -585,6 +582,7 @@ def developer_diagnostics_payload(
     enabled: bool,
     scenario,
     selected_entry: dict,
+    scenario_path: Optional[str],
     timings: dict[str, float],
     timeline,
 ):
@@ -593,7 +591,7 @@ def developer_diagnostics_payload(
     return {
         "Expected failure signature": scenario.expected_failure_signature,
         "Scenario ID": scenario.scenario_id,
-        "Scenario path": str(selected_entry["path"]),
+        "Scenario path": scenario_path or "Uploaded logs",
         "Execution timings": timings,
         "Parsed events": [entry.event.model_dump() for entry in timeline.entries],
         "Normalized events": [entry.event.model_dump() for entry in timeline.entries],
@@ -617,6 +615,7 @@ def run_analysis(
     context,
     analysis_mode: str,
     should_generate_live: bool,
+    evidence: InvestigationEvidence | None = None,
 ):
     timings = {
         "openai_request": 0.0,
@@ -625,7 +624,7 @@ def run_analysis(
 
     if analysis_mode == "Simulated":
         checkpoint = perf_counter()
-        summary = generate_simulated_investigation_summary(context)
+        summary = generate_simulated_investigation_summary(context, evidence=evidence)
         timings["fallback_generation"] = perf_counter() - checkpoint
         return summary, True, None, timings
 
@@ -640,7 +639,7 @@ def run_analysis(
     except Exception as exc:
         timings["openai_request"] = perf_counter() - checkpoint
         fallback_started = perf_counter()
-        summary = generate_simulated_investigation_summary(context)
+        summary = generate_simulated_investigation_summary(context, evidence=evidence)
         timings["fallback_generation"] = perf_counter() - fallback_started
         return summary, True, str(exc), timings
 
@@ -859,6 +858,8 @@ def main() -> None:
             st.error(f"Failed to process uploaded logs: {str(e)}")
             return
 
+    evidence = select_investigation_evidence(context)
+
     show_developer_diagnostics = st.sidebar.checkbox(
         "Show developer diagnostics",
         value=False,
@@ -881,12 +882,14 @@ def main() -> None:
                 context,
                 analysis_mode=analysis_mode,
                 should_generate_live=should_generate_live,
+                evidence=evidence,
             )
     else:
         summary, used_fallback, analysis_error, analysis_timings = run_analysis(
             context,
             analysis_mode=analysis_mode,
             should_generate_live=should_generate_live,
+            evidence=evidence,
         )
 
     total_page_execution = (
@@ -897,37 +900,42 @@ def main() -> None:
 
     st.title("Recovery Decision Investigator")
 
+    report_view = None
+    if summary is not None:
+        report_view = build_investigation_report_view(evidence, summary, scenario, timeline)
+
     st.subheader("Incident Summary")
-    started = format_event_timestamp(to_iso_utc(timeline.started_at.isoformat()))
-    completed = format_event_timestamp(to_iso_utc(timeline.ended_at.isoformat()))
-    end_label = "Failed At" if scenario.expected_outcome == "FAILED" else "Ended At"
+    incident_summary = report_view.incident_summary if report_view is not None else None
 
     st.markdown("<div class='incident-group-header'>Recovery Job</div>", unsafe_allow_html=True)
     identity_col1, identity_col2, identity_col3 = st.columns(3)
     with identity_col1:
-        render_incident_field("Customer", scenario.customer)
+        render_incident_field("Customer", incident_summary.customer if incident_summary is not None else scenario.customer)
     with identity_col2:
-        render_incident_field("Job ID", scenario.job_id)
+        render_incident_field("Job ID", incident_summary.job_id if incident_summary is not None else scenario.job_id)
     with identity_col3:
-        render_incident_field("Status", status_display(scenario.expected_outcome), is_status=True)
+        render_incident_field("Status", status_display(incident_summary.status if incident_summary is not None else scenario.expected_outcome), is_status=True)
 
     st.markdown("<div class='incident-group-header'>Operation</div>", unsafe_allow_html=True)
     operation_col1, operation_col2, operation_col3 = st.columns(3)
     with operation_col1:
-        render_incident_field("Operation", infer_operation(scenario.job_id))
+        render_incident_field("Operation", incident_summary.operation if incident_summary is not None else "Unknown")
     with operation_col2:
-        render_incident_field("Target", infer_target(timeline))
+        render_incident_field("Target", incident_summary.target if incident_summary is not None else "Not provided")
     with operation_col3:
-        render_incident_field("Environment", "Production")
+        render_incident_field("Environment", incident_summary.environment if incident_summary is not None else "Not provided")
 
     st.markdown("<div class='incident-group-header'>Timeline</div>", unsafe_allow_html=True)
     timeline_col1, timeline_col2, timeline_col3 = st.columns(3)
     with timeline_col1:
-        render_incident_field("Started", started)
+        render_incident_field("Started", incident_summary.started if incident_summary is not None else "Timestamp unavailable")
     with timeline_col2:
-        render_incident_field(end_label, completed)
+        render_incident_field(
+            incident_summary.ended_label if incident_summary is not None else "Ended At",
+            incident_summary.ended if incident_summary is not None else "Timestamp unavailable",
+        )
     with timeline_col3:
-        render_incident_field("Duration", format_duration(timeline.duration_seconds))
+        render_incident_field("Duration", incident_summary.duration if incident_summary is not None else "Unknown")
 
     st.subheader("Investigation Status")
     st.markdown("🟢 Completed")
@@ -946,83 +954,106 @@ def main() -> None:
         st.caption("Execution Time")
         st.caption(execution_meta["execution_time"])
 
-    if summary is not None:
-        summary_text, causal_event_text = split_root_cause_text(summary.likely_root_cause)
-        primary_causal_event = summarize_causal_event(causal_event_text)
-
-        st.subheader("Evidence Timeline")
-        for item in evidence_timeline_items(timeline, causal_event_text):
-            metadata_line = item["source"]
-            if item["component_name"]:
-                metadata_line = f"{metadata_line} • {item['component_name']}"
+    if report_view is not None:
+        st.subheader("Investigation Timeline")
+        for item in report_view.timeline_items:
+            metadata_line = item.source
+            if item.component_name and item.component_name != item.source:
+                metadata_line = f"{metadata_line} • {item.component_name}"
             st.markdown(
                 (
                     "<div class='timeline-event'>"
-                    f"<div class='timeline-time'>{item['time']}</div>"
-                    f"<div class='timeline-title'>{item['stage']}</div>"
+                    f"<div class='timeline-time'>{item.time}</div>"
+                    f"<div class='timeline-title'>{item.title}</div>"
                     f"<div class='timeline-meta'>{metadata_line}</div>"
-                    f"<div class='timeline-detail'>{item['detail']}</div>"
+                    f"<div class='timeline-detail'>{item.display_detail}</div>"
                     "</div>"
                 ),
                 unsafe_allow_html=True,
             )
+            if item.detail_items:
+                with st.expander(f"Supporting evidence ({item.supporting_evidence_count})", expanded=False):
+                    for detail in item.detail_items:
+                        source_bits = [detail.source]
+                        if detail.source_document_id:
+                            source_bits.append(detail.source_document_id)
+                        st.write(f"{detail.event_id}. {detail.display_summary}")
+                        st.caption(f"{detail.time} • {' • '.join(source_bits)}")
+                        if detail.display_detail and detail.display_detail != detail.display_summary:
+                            st.caption(detail.display_detail)
 
         st.subheader("Investigation Findings")
-        st.markdown("**Root Cause**")
-        if scenario.expected_outcome == "RECOVERED":
-            sections = recovered_scenario_sections(summary_text, timeline)
-            st.write(sections["Primary disruption"])
-            if primary_causal_event is not None:
-                st.markdown("**Primary Causal Event**")
-                st.write(primary_causal_event)
-            st.markdown("**Customer Impact**")
-            st.write(customer_impact_text(scenario.expected_outcome))
-            st.markdown("**Recovery**")
-            st.write(sections["Recovery"])
-            st.markdown("**Successful Outcome**")
-            st.write(sections["Successful outcome"])
-        else:
-            st.write(summary_text)
-            if primary_causal_event is not None:
-                st.markdown("**Primary Causal Event**")
-                st.write(primary_causal_event)
-            st.markdown("**Customer Impact**")
-            st.write(customer_impact_text(scenario.expected_outcome))
+        st.markdown("**Observed Failure**")
+        st.write(report_view.observed_failure or report_view.root_cause)
+        st.markdown("**Inferred Explanation**")
+        st.write(report_view.inferred_explanation or report_view.root_cause)
+        if report_view.primary_causal_event is not None:
+            st.markdown("**Primary Causal Event**")
+            primary_text = report_view.primary_causal_label or report_view.primary_causal_event.display_summary or report_view.primary_causal_event.message
+            st.write(primary_text)
+        st.markdown("**Customer Impact**")
+        st.write(report_view.customer_impact)
+        if report_view.outcome_summary:
+            st.markdown("**Outcome Summary**")
+            st.write(report_view.outcome_summary)
+        if report_view.evidence_gaps:
+            st.markdown("**Evidence Gaps**")
+            for gap in report_view.evidence_gaps:
+                st.write(f"• {gap}")
 
         st.subheader("Recommended Actions")
-        immediate_actions, preventative_actions = split_recommendations(
-            summary.next_actions,
-            root_cause_text=summary_text,
-        )
-        st.markdown("**Immediate Actions**")
-        for i, action in enumerate(immediate_actions, 1):
-            st.write(f"{i}. {action}")
-        if preventative_actions:
-            st.markdown("**Prevent Future Failures**")
-            for i, action in enumerate(preventative_actions, 1):
+        if report_view.recommended_actions:
+            action_categories = [
+                "Immediate investigation",
+                "Immediate mitigation",
+                "Preventive improvement",
+            ]
+            for category in action_categories:
+                grouped_actions = [item for item in report_view.recommended_actions if item.category == category]
+                if not grouped_actions:
+                    continue
+                st.markdown(f"**{category}**")
+                for i, action in enumerate(grouped_actions, 1):
+                    st.write(f"{i}. {action.action}")
+                    st.caption(action.rationale)
+        else:
+            st.markdown("**Immediate Actions**")
+            for i, action in enumerate(report_view.immediate_actions, 1):
                 st.write(f"{i}. {action}")
+            if report_view.preventive_actions:
+                st.markdown("**Prevent Future Failures**")
+                for i, action in enumerate(report_view.preventive_actions, 1):
+                    st.write(f"{i}. {action}")
 
         st.subheader("Investigation Confidence")
         conf_col1, conf_col2 = st.columns(2)
-        conf_col1.metric("Investigation Confidence", f"{summary.confidence:.0%}")
-        conf_col2.metric("Level", confidence_label(summary.confidence))
+        conf_col1.metric("Investigation Confidence", f"{report_view.confidence:.0%}")
+        conf_col2.metric("Level", report_view.confidence_level)
         st.markdown("**Supporting Evidence**")
-        reason_lines, confidence_conclusion = confidence_reason_lines(timeline, summary.confidence_explanation)
-        st.write("The investigation considered:")
-        for line in reason_lines:
-            st.write(f"• {line}")
-        st.write(confidence_conclusion)
+        for item in report_view.supporting_evidence:
+            if item.source_document_id:
+                st.write(f"• {item.display_summary} [{item.event_id}; {item.source_document_id}]")
+            else:
+                st.write(f"• {item.display_summary} [{item.event_id}]")
+        for line in report_view.confidence_explanation:
+            st.write(line)
+        if report_view.confidence_dimensions:
+            st.markdown("**Confidence Dimensions**")
+            for dimension in report_view.confidence_dimensions:
+                st.write(f"• {dimension.dimension}: {dimension.level}")
+                st.caption(dimension.rationale)
 
         if show_developer_diagnostics:
             with st.expander("Confidence component debug", expanded=False):
                 st.write("Component values before clamping and final formatting:")
-                st.dataframe(confidence_debug_rows(summary.confidence_breakdown), use_container_width=True, hide_index=True)
-                st.write(f"Raw summed confidence: {sum(summary.confidence_breakdown.values()):.2f}")
+                st.dataframe(confidence_debug_rows(evidence.confidence_breakdown), use_container_width=True, hide_index=True)
+                st.write(f"Raw summed confidence: {sum(evidence.confidence_breakdown.values()):.2f}")
 
     diagnostics_payload = developer_diagnostics_payload(
         enabled=show_developer_diagnostics,
         scenario=scenario,
         selected_entry=selected_entry,
+        scenario_path=str(scenario_path) if scenario_path is not None else None,
         timings={
             **processing_timings,
             "openai_request": analysis_timings["openai_request"],

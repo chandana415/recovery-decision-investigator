@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -22,12 +23,24 @@ except ImportError:
     st = None  # For non-Streamlit contexts (tests, etc.)
 
 from recovery_workspace.models import (
+    ConfidenceDimensionView,
     Event,
     EventContext,
+    EvidenceItem,
+    IncidentSummaryView,
     InvestigationContext,
+    InvestigationEvidence,
+    InvestigationReportView,
     InvestigationSummary,
+    RecommendedActionView,
+    SupportingEvidenceItem,
+    TimelineFindingDetail,
     TimelineEntryContext,
+    TimelineReportItem,
+    Scenario,
 )
+from recovery_workspace.evidence_grouping import group_evidence_for_timeline
+from recovery_workspace.semantics import canonical_error_code
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -48,7 +61,13 @@ def _format_event_context(event: Event) -> EventContext:
         level=event.level,
         error_code=event.error_code,
         message=event.message,
+        source_file=event.source_file,
         structured_fields=event.structured_fields,
+        event_type=event.event_type,
+        terminal_state=event.terminal_state,
+        cause_type=event.cause_type,
+        semantic_error_code=event.semantic_error_code,
+        observed_cause=event.observed_cause,
     )
 
 
@@ -61,7 +80,13 @@ def _format_timeline_entry_context(entry: Any) -> TimelineEntryContext:
         error_code=entry.event.error_code,
         message=entry.event.message,
         gap_before_seconds=entry.gap_before_seconds,
+        source_file=entry.event.source_file,
         structured_fields=entry.event.structured_fields,
+        event_type=entry.event.event_type,
+        terminal_state=entry.event.terminal_state,
+        cause_type=entry.event.cause_type,
+        semantic_error_code=entry.event.semantic_error_code,
+        observed_cause=entry.event.observed_cause,
     )
 
 
@@ -260,6 +285,12 @@ FAILURE_RULES = [
         ("partial_success", "completed with", "3/4", "task", "volumes succeeded"),
         {"backup_service", "network", "storage"},
     ),
+    (
+        "resource_access_failure",
+        {"RESOURCE_ACCESS_FAILURE"},
+        ("bad file descriptor", "stale file handle", "input/output error", "i/o error", "too many open files", "read-only file system"),
+        None,
+    ),
 ]
 EXACT_SIGNAL_WEIGHTS = {
     "QUOTA_EXCEEDED": 0.3,
@@ -275,6 +306,513 @@ EXACT_SIGNAL_WEIGHTS = {
     "CLOCK_SKEW_DETECTED": 0.3,
     "PARTIAL_SUCCESS": 0.18,
 }
+
+
+def _evidence_timestamp_source(entry: TimelineEntryContext) -> str:
+    structured_fields = getattr(entry, "structured_fields", None) or {}
+    value = structured_fields.get("timestamp_source")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "parsed"
+
+
+def _evidence_source_file(entry: TimelineEntryContext) -> Optional[str]:
+    source_file = getattr(entry, "source_file", None)
+    if isinstance(source_file, str) and source_file.strip():
+        return source_file.strip()
+    structured_fields = getattr(entry, "structured_fields", None) or {}
+    for key in ("source_file", "source_filename", "file", "path"):
+        value = structured_fields.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _legacy_evidence_event_type_fallback(entry: TimelineEntryContext) -> Optional[str]:
+    structured_fields = getattr(entry, "structured_fields", None) or {}
+    value = structured_fields.get("event_type") or structured_fields.get("message_type")
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    if entry.level == "ERROR":
+        return "TERMINAL_FAILURE"
+    if entry.level == "WARN":
+        return "WARNING"
+    if entry.level == "INFO":
+        return "INFO"
+    return None
+
+
+def _evidence_event_type(entry: TimelineEntryContext) -> Optional[str]:
+    value = getattr(entry, "event_type", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    return _legacy_evidence_event_type_fallback(entry)
+
+
+def _legacy_evidence_terminal_state_fallback(entry: TimelineEntryContext) -> Optional[str]:
+    return None
+
+
+def _evidence_terminal_state(entry: TimelineEntryContext, role: str) -> Optional[str]:
+    value = getattr(entry, "terminal_state", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return _legacy_evidence_terminal_state_fallback(entry)
+
+
+def _legacy_evidence_cause_type_fallback(entry: TimelineEntryContext) -> Optional[str]:
+    return None
+
+
+def _evidence_cause_type(entry: TimelineEntryContext) -> Optional[str]:
+    value = getattr(entry, "cause_type", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    return _legacy_evidence_cause_type_fallback(entry)
+
+
+def _shorten_message(message: str, *, limit: int = 96) -> str:
+    cleaned = " ".join(message.split()).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _humanize_identifier(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    text = re.sub(r"[_\-]+", " ", value).strip()
+    if not text:
+        return ""
+    return " ".join(part.capitalize() for part in text.split())
+
+
+def _strip_internal_placeholders(text: str) -> str:
+    cleaned = text
+    for token in ("PLAINTEXT_FATAL", "RAW_UNPARSED", "NO_CODE", "UNKNOWN_CODE"):
+        cleaned = re.sub(rf"\b{re.escape(token)}\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\n\r:-—")
+    return cleaned
+
+
+def _role_fallback(role: str) -> str:
+    return {
+        "CONTEXT": "Operation context recorded.",
+        "CONTRIBUTING": "A contributing operational issue was detected.",
+        "PRIMARY_CAUSE": "A direct failure signal was identified.",
+        "PROPAGATION": "The failure prevented the next processing step.",
+        "OUTCOME": "The operation ended unsuccessfully.",
+    }.get(role, "Operational failure detected.")
+
+
+def _generic_sentence(text: str) -> str:
+    cleaned = _strip_internal_placeholders(" ".join(text.split()))
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"^(?:fatal|error|panic|warning)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip(" \t\n\r:-—")
+    if not cleaned:
+        return ""
+    return cleaned[0].upper() + cleaned[1:]
+
+
+def _concise_observed_message(text: str) -> str:
+    cleaned = _strip_internal_placeholders(" ".join(text.split()))
+    cleaned = re.sub(
+        r"^[A-Za-z0-9_.-]+\s+[A-Za-z0-9_.-]+\s+(INFO|WARN|ERROR|WARNING|DEBUG)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^(level|logger|message|thread|throwable|cause|stack|suppressed)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    return _generic_sentence(cleaned)
+
+
+def _format_report_timestamp(timestamp_text: Optional[str], timestamp_source: Optional[str]) -> str:
+    if not timestamp_text or timestamp_source not in {"available", "parsed"}:
+        return "Timestamp unavailable"
+    parsed = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _extract_http_failure_observation(text: str) -> Optional[str]:
+    compact = " ".join(text.split())
+    status_match = re.search(r"\bHTTP\s*(?P<status>[45]\d\d)\b", compact, re.IGNORECASE)
+    if not status_match:
+        status_match = re.search(r"\b(?P<status>[45]\d\d)\s+(?P<phrase>Unauthorized|Forbidden|Not Found|Conflict|Bad Request)\b", compact, re.IGNORECASE)
+    if not status_match:
+        return None
+
+    status = status_match.group("status")
+    reason_match = re.search(r"\b(Unauthorized|Forbidden|Conflict|Bad Request|Service Unavailable)\b", compact, re.IGNORECASE)
+    reason = reason_match.group(1) if reason_match else "response"
+    method_match = re.search(r"\b(GET|PUT|POST|DELETE|PATCH|HEAD|OPTIONS)\b", compact, re.IGNORECASE)
+    method = method_match.group(1).upper() if method_match else "request"
+    if method == "REQUEST":
+        return f"A downstream request received HTTP {status} {reason}."
+    return f"A downstream {method} request received HTTP {status} {reason}."
+
+
+def _timeline_entry_timestamp_source(entry: Any) -> str:
+    structured_fields = getattr(entry.event, "structured_fields", None) or {}
+    value = structured_fields.get("timestamp_source")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return "parsed"
+
+
+def _derive_incident_operation(scenario: Scenario) -> str:
+    observed_text = " ".join(
+        value for value in (scenario.name, scenario.description, scenario.job_id) if isinstance(value, str)
+    ).lower()
+    if "restore" in observed_text:
+        return "Recovery Restore"
+    if "weekly" in observed_text and "backup" in observed_text:
+        return "Scheduled Full Backup"
+    if "nightly" in observed_text and "backup" in observed_text:
+        return "Scheduled Nightly Backup"
+    if "backup" in observed_text and scenario.category != "uploaded":
+        return "Scheduled Backup"
+    return "Unknown"
+
+
+def _derive_incident_target(timeline: Any) -> str:
+    patterns = (
+        r"storage account ([A-Za-z0-9\-_]+)",
+        r"on ([A-Za-z0-9\-_]+-bucket)",
+        r"for ([A-Za-z0-9\-_]+/[A-Za-z0-9\-_.]+)",
+        r"endpoint\s+([A-Za-z0-9:/._\-]+)",
+        r"url\s+([A-Za-z0-9:/._\-]+)",
+    )
+    for entry in timeline.entries:
+        message = entry.event.message
+        for pattern in patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                return match.group(1)
+    return "Not provided"
+
+
+def _derive_incident_environment(scenario: Scenario, timeline: Any) -> str:
+    candidates = [scenario.name, scenario.description, scenario.job_id]
+    candidates.extend(entry.event.message for entry in timeline.entries)
+    joined = " ".join(text for text in candidates if isinstance(text, str)).lower()
+    if re.search(r"\bproduction\b", joined):
+        return "Production"
+    if re.search(r"\bstaging\b", joined):
+        return "Staging"
+    if re.search(r"\bdevelopment\b", joined) or re.search(r"\bdev\b", joined):
+        return "Development"
+    return "Not provided"
+
+
+def _build_incident_summary_view(scenario: Scenario, timeline: Any) -> IncidentSummaryView:
+    first_entry = timeline.entries[0]
+    last_entry = timeline.entries[-1]
+    started_source = _timeline_entry_timestamp_source(first_entry)
+    ended_source = _timeline_entry_timestamp_source(last_entry)
+    started = _format_report_timestamp(first_entry.event.timestamp.isoformat(), started_source)
+    ended = _format_report_timestamp(last_entry.event.timestamp.isoformat(), ended_source)
+    duration = (
+        f"{timeline.duration_seconds:.0f}s"
+        if started_source in {"available", "parsed"} and ended_source in {"available", "parsed"}
+        else "Unknown"
+    )
+
+    return IncidentSummaryView(
+        customer=scenario.customer,
+        job_id=scenario.job_id,
+        status=scenario.expected_outcome,
+        operation=_derive_incident_operation(scenario),
+        target=_derive_incident_target(timeline),
+        environment=_derive_incident_environment(scenario, timeline),
+        started=started,
+        ended_label="Failed At" if scenario.expected_outcome == "FAILED" else "Ended At",
+        ended=ended,
+        duration=duration,
+    )
+
+
+def _report_confidence_explanation(evidence: InvestigationEvidence) -> list[str]:
+    lines: list[str] = []
+    for line in evidence.confidence_explanation:
+        if line not in lines:
+            lines.append(line)
+    for line in evidence.limitations:
+        formatted = line if line.startswith(("•", "✓")) else f"• {line}"
+        if formatted not in lines:
+            lines.append(formatted)
+    return lines
+
+
+def build_evidence_display(entry: TimelineEntryContext, role: str) -> tuple[str, str]:
+    structured_fields = getattr(entry, "structured_fields", None) or {}
+    semantic_code = (getattr(entry, "semantic_error_code", None) or canonical_error_code(entry) or "").upper()
+    observed_cause = (getattr(entry, "observed_cause", None) or "").strip()
+
+    if semantic_code == "RESOURCE_ACCESS_FAILURE":
+        summary = "Object metadata access failed." if "object info" in entry.message.lower() else "Resource access failed."
+        if "object info" in entry.message.lower():
+            detail = (
+                f"The service could not read object metadata because the underlying system returned {observed_cause}."
+                if observed_cause
+                else "The service could not read object metadata because the underlying system returned a low-level resource-access error."
+            )
+        else:
+            detail = (
+                f"The service could not access the required resource because the underlying system returned {observed_cause}."
+                if observed_cause
+                else "The service could not access the required resource because the underlying system returned a low-level resource-access error."
+            )
+        return summary, detail
+
+    semantic_bits: list[str] = []
+    for value in (
+        getattr(entry, "cause_type", None),
+        getattr(entry, "event_type", None),
+        getattr(entry, "terminal_state", None),
+        structured_fields.get("message_type"),
+    ):
+        if isinstance(value, str) and value.strip():
+            humanized = _humanize_identifier(value)
+            if humanized and humanized.upper() not in {
+                "PLAINTEXT FATAL",
+                "RAW UNPARSED",
+                "NO CODE",
+                "UNKNOWN CODE",
+                "UNKNOWN",
+                "ERROR",
+                "INFO",
+                "WARN",
+                "WARNING",
+                "TERMINAL FAILURE",
+            }:
+                semantic_bits.append(humanized)
+
+    clean_message = _generic_sentence(entry.message)
+    summary = ""
+    if semantic_bits:
+        if role == "PRIMARY_CAUSE":
+            summary = f"{semantic_bits[0]} failure detected."
+        elif role == "OUTCOME":
+            summary = f"{semantic_bits[0]} outcome recorded."
+        elif role == "CONTRIBUTING":
+            summary = f"{semantic_bits[0]} contributing condition."
+        elif role == "PROPAGATION":
+            summary = f"{semantic_bits[0]} propagation event."
+        else:
+            summary = f"{semantic_bits[0]} context."
+    elif clean_message:
+        summary = clean_message
+    else:
+        summary = _role_fallback(role)
+
+    detail = ""
+    if clean_message:
+        if role == "CONTEXT":
+            detail = f"Context: {clean_message}"
+        elif role == "CONTRIBUTING":
+            detail = f"Contributing issue: {clean_message}"
+        elif role == "PRIMARY_CAUSE":
+            detail = f"Primary cause: {clean_message}"
+        elif role == "PROPAGATION":
+            detail = f"Propagation: {clean_message}"
+        elif role == "OUTCOME":
+            detail = f"Outcome: {clean_message}"
+        else:
+            detail = clean_message
+    else:
+        detail = _role_fallback(role)
+
+    if not summary:
+        summary = _role_fallback(role)
+    if not detail:
+        detail = summary
+    return summary, detail
+
+
+def _evidence_signature(entry: TimelineEntryContext) -> tuple[str, str, str, str]:
+    return (
+        entry.component.lower().strip(),
+        (entry.error_code or "").strip().lower(),
+        entry.level.lower().strip(),
+        _shorten_message(entry.message, limit=120).lower(),
+    )
+
+
+def _semantic_causal_strength(entry: TimelineEntryContext) -> int:
+    score = 0
+    event_type = (getattr(entry, "event_type", None) or "").upper()
+    semantic_error_code = (getattr(entry, "semantic_error_code", None) or canonical_error_code(entry) or "").upper()
+    cause_type = (getattr(entry, "cause_type", None) or "").upper()
+
+    if cause_type in {
+        "STORAGE_CAPACITY",
+        "RESOURCE_EXHAUSTION",
+        "RESOURCE_ACCESS",
+        "AUTHENTICATION",
+        "AUTHORIZATION",
+        "REPOSITORY_CORRUPTION",
+        "NETWORK_TIMEOUT",
+        "SERVICE_UNAVAILABLE",
+        "CONFIGURATION_FAILURE",
+        "DEPENDENCY_FAILURE",
+        "LOCK_OR_CONCURRENCY",
+        "RESOURCE_OR_ACCESS_CONTENTION",
+    }:
+        score += 4
+
+    if event_type in {
+        "LOCK_OR_CONCURRENCY_FAILURE",
+        "TERMINAL_FAILURE",
+        "PARTIAL_FAILURE",
+    }:
+        score += 3
+
+    if semantic_error_code in {
+        "LOCK_OR_CONCURRENCY_FAILURE",
+        "RESOURCE_ACCESS_FAILURE",
+        "RESOURCE_EXHAUSTION",
+        "QUOTA_EXCEEDED",
+        "ACCESS_DENIED",
+        "PERMISSION_DENIED",
+        "CORRUPTION_DETECTED",
+        "ETIMEDOUT",
+        "ENETUNREACH",
+        "ECONNRESET",
+        "SERVICE_UNAVAILABLE",
+        "REQUEST_TIME_TOO_SKEWED",
+        "UNKNOWN_TERMINAL_FAILURE",
+    }:
+        score += 2
+
+    if event_type in {"ACCESS_OR_RESOURCE_CONFLICT"}:
+        score += 1
+
+    if entry.level == "ERROR":
+        score += 1
+    elif entry.level == "WARN":
+        score += 0
+
+    if entry.error_code and entry.error_code not in {"PLAINTEXT", "RAW_UNPARSED", "ERROR", "PLAINTEXT_FATAL"}:
+        score += 1
+
+    return score
+
+
+def _is_outcome_signal(entry: TimelineEntryContext) -> bool:
+    event_type = (getattr(entry, "event_type", None) or "").upper()
+    semantic_error_code = (getattr(entry, "semantic_error_code", None) or canonical_error_code(entry) or "").upper()
+    terminal_state = (getattr(entry, "terminal_state", None) or "").lower()
+    raw_error_code = (getattr(entry, "error_code", None) or "").upper()
+
+    if event_type in {"TERMINAL_FAILURE", "TERMINAL_SUCCESS", "PARTIAL_FAILURE", "OPERATION_ABORTED_OR_CANCELLED"}:
+        return True
+    if semantic_error_code in {"EXIT_FAILURE", "EXIT_SUCCESS", "MIXED_CHILD_EXITS", "JOB_FAILED", "RETRY_EXHAUSTED", "PARTIAL_SUCCESS", "OPERATION_ABORTED_OR_CANCELLED"}:
+        return True
+    if raw_error_code in {"JOB_FAILED", "EXIT_FAILURE", "EXIT_SUCCESS", "PARTIAL_SUCCESS", "RETRY_EXHAUSTED"}:
+        return True
+    return False
+
+
+def _is_direct_causal_signal(entry: TimelineEntryContext) -> bool:
+    return _semantic_causal_strength(entry) > 0 and not _is_outcome_signal(entry)
+
+
+def _is_explicit_propagation_signal(entry: TimelineEntryContext) -> bool:
+    event_type = (getattr(entry, "event_type", None) or "").upper()
+    return event_type == "PROPAGATION"
+
+
+def _is_progress_noise(entry: TimelineEntryContext) -> bool:
+    text = _entry_text(entry)
+    noisy_terms = (
+        "progress",
+        "scanning",
+        "copying",
+        "transferring",
+        "remaining",
+        "bytes",
+        "items processed",
+        "files processed",
+        "percent",
+        "step",
+    )
+    if any(term in text for term in noisy_terms) and not any(
+        term in text for term in ("fail", "error", "fatal", "unable", "cannot", "warn")
+    ):
+        return True
+    return False
+
+
+def _is_failure_related(entry: TimelineEntryContext) -> bool:
+    text = _entry_text(entry)
+    failure_terms = (
+        "fail",
+        "failed",
+        "unable",
+        "cannot",
+        "could not",
+        "denied",
+        "blocked",
+        "held",
+        "locked",
+        "error",
+        "fatal",
+        "canceled",
+        "cancelled",
+    )
+    return any(term in text for term in failure_terms)
+
+
+def _primary_candidate_score(entry: TimelineEntryContext) -> int:
+    score = 0
+    if _is_progress_noise(entry):
+        return -100
+    if _is_failure_related(entry):
+        score += 2
+    if entry.level == "ERROR":
+        score += 2
+    elif entry.level == "WARN":
+        score += 1
+    canonical = _canonical_error_code(entry)
+    if canonical in EXACT_SIGNAL_WEIGHTS:
+        score += 3
+    elif entry.error_code and entry.error_code not in {"PLAINTEXT", "RAW_UNPARSED", "ERROR", "PLAINTEXT_FATAL"}:
+        score += 1
+    if _evidence_timestamp_source(entry) in {"inherited", "interpolated", "unavailable"}:
+        score -= 1
+    return score
+
+
+def _evidence_item(
+    entry: TimelineEntryContext,
+    *,
+    role: str,
+    mode: str,
+) -> EvidenceItem:
+    display_summary, display_detail = build_evidence_display(entry, role)
+    return EvidenceItem(
+        event_id=f"{entry.sequence}",
+        sequence=entry.sequence,
+        timestamp=entry.timestamp,
+        timestamp_source=_evidence_timestamp_source(entry),
+        component=entry.component,
+        event_type=_evidence_event_type(entry),
+        terminal_state=_evidence_terminal_state(entry, role),
+        cause_type=_evidence_cause_type(entry),
+        error_code=entry.error_code or canonical_error_code(entry),
+        semantic_error_code=getattr(entry, "semantic_error_code", None) or canonical_error_code(entry),
+        observed_cause=getattr(entry, "observed_cause", None),
+        original_message=entry.message,
+        message=entry.message,
+        role=role,  # type: ignore[arg-type]
+        source_file=_evidence_source_file(entry),
+        structured_fields=dict(entry.structured_fields),
+        summary=display_summary,
+        display_summary=display_summary,
+        display_detail=display_detail,
+    )
 
 
 def _entry_text(entry: TimelineEntryContext) -> str:
@@ -337,6 +875,8 @@ def _mode_from_text(text: str) -> Optional[str]:
         return "clock_skew"
     if any(term in lowered for term in ("partial success", "completed with", "3/4", "volumes succeeded")):
         return "partial_failure"
+    if any(term in lowered for term in ("bad file descriptor", "stale file handle", "input/output error", "i/o error", "too many open files", "read-only file system")):
+        return "resource_access_failure"
     return None
 
 
@@ -367,33 +907,7 @@ def _structured_message_type(entry: TimelineEntryContext) -> str:
 
 
 def _canonical_error_code(entry: TimelineEntryContext) -> Optional[str]:
-    text = _entry_text(entry)
-    structured_text = _structured_text(entry)
-    message_type = _structured_message_type(entry)
-    if message_type not in {"error", "exit_error"} and entry.level != "ERROR":
-        return None
-
-    candidates = [
-        ("QUOTA_EXCEEDED", ("no space left on device", "out of space", "disk full", "quota", "capacity", "enospc")),
-        ("ACCESS_DENIED", ("wrong password", "no key found", "access denied", "permission denied", "unauthorized", "forbidden", "authentication failed")),
-        ("CORRUPTION_DETECTED", ("pack id does not match", "checksum mismatch", "corrupt", "corruption", "integrity", "blob corruption")),
-        ("ETIMEDOUT", ("timed out", "timeout", "network timeout")),
-        ("ECONNRESET", ("connection reset", "reset by peer")),
-        ("ENETUNREACH", ("network unreachable", "unreachable")),
-        ("SERVICE_UNAVAILABLE", ("service unavailable", "503", "maintenance mode", "dependency outage")),
-        ("REQUEST_TIME_TOO_SKEWED", ("clock skew", "time skew", "skewed", "ahead of server time")),
-        ("PARTIAL_SUCCESS", ("partial success", "completed with", "3/4", "volumes succeeded")),
-    ]
-
-    haystack = f"{structured_text} {text}"
-    for code, terms in candidates:
-        if any(term in haystack for term in terms):
-            return code
-    if _has_failure_prefix(entry):
-        return "PLAINTEXT_FATAL"
-    if message_type in {"error", "exit_error"}:
-        return "ERROR"
-    return None
+    return canonical_error_code(entry)
 
 
 def _inferred_failure_mode(
@@ -416,6 +930,8 @@ def _inferred_failure_mode(
         return "clock_skew"
     if canonical in {"PARTIAL_SUCCESS"}:
         return "partial_failure"
+    if canonical in {"RESOURCE_ACCESS_FAILURE"}:
+        return "resource_access_failure"
     if _has_failure_prefix(entry) or _structured_message_type(entry) in {"error", "exit_error"} or entry.level in {"WARN", "ERROR"}:
         mode = _mode_from_text(_failure_blob(entries, index, radius=1))
         if mode:
@@ -438,16 +954,16 @@ def _is_terminal_outcome_event(entry: TimelineEntryContext) -> bool:
 def _find_terminal_sequence(entries: list[TimelineEntryContext]) -> Optional[int]:
     terminal_entries = [entry for entry in entries if _is_terminal_outcome_event(entry)]
     if not terminal_entries:
-        return None
+        fallback_entries = [
+            entry
+            for entry in entries
+            if entry.level == "ERROR"
+            and (_is_failure_related(entry) or _has_failure_prefix(entry) or _structured_message_type(entry) in {"error", "exit_error"})
+        ]
+        if not fallback_entries:
+            return None
+        return fallback_entries[-1].sequence
     return terminal_entries[-1].sequence
-
-
-def _build_evidence_line(entry: TimelineEntryContext) -> str:
-    code = entry.error_code or "NO_CODE"
-    return (
-        f"Event #{entry.sequence}: {entry.component} {entry.level} {code} at {entry.timestamp} — "
-        f"{entry.message}"
-    )
 
 
 def _find_matching_entries(
@@ -510,7 +1026,11 @@ def _fatal_fallback_entries(entries: list[TimelineEntryContext]) -> list[Timelin
     return [
         entry
         for entry in entries
-        if _has_failure_prefix(entry) or entry.error_code in {"PLAINTEXT_FATAL", "RAW_UNPARSED"} and entry.level == "ERROR"
+        if (
+            _has_failure_prefix(entry)
+            or (entry.level == "ERROR" and _is_failure_related(entry))
+            or entry.error_code in {"PLAINTEXT_FATAL", "RAW_UNPARSED"}
+        )
     ]
 
 
@@ -601,6 +1121,13 @@ def _evidence_grounded_actions(
             "Track per-task success/failure metrics so partial outcomes trigger explicit remediation workflows.",
             "Review whether child task failures are related to resource contention or environmental issues.",
         ],
+        "resource_access_failure": [
+            "Inspect service, operating-system, and I/O logs around the failure timestamp.",
+            "Verify the health of the affected resource and host before retrying.",
+            "Correlate repeated metadata-access failures using the affected resource and surrounding time window.",
+            "Retry only after confirming the resource and service are healthy.",
+            "Alert on repeated metadata-access or low-level I/O failures and preserve correlation identifiers with structured cause fields.",
+        ],
         "corruption": [
             "Verify repository integrity and repair or recreate corrupted packs before rerunning the job.",
             "Check for disk or storage path issues that may be truncating writes or corrupting blob data.",
@@ -608,7 +1135,7 @@ def _evidence_grounded_actions(
         ],
         "generic_fatal": [
             "Inspect the fatal line together with the immediately surrounding log lines for the missing failure family.",
-            "Preserve raw restic stderr/plaintext output so generic fatal lines are not lost during normalization.",
+            "Preserve raw plaintext or structured error output so generic fatal lines are not lost during normalization.",
             "Add richer fatal-line heuristics for unknown-but-failing events.",
         ],
     }
@@ -676,113 +1203,57 @@ def _evidence_grounded_actions(
     ]
 
 
-def _scenario_specific_actions(mode: str) -> list[str]:
-    """Legacy template-based actions. Use _evidence_grounded_actions instead."""
-    if mode == "quota_exhaustion":
-        return [
-            "Increase destination storage capacity or prune old backup artifacts before the next run.",
-            "Trigger proactive quota alerts earlier so backup jobs are blocked before upload begins.",
-            "Mark quota-exceeded failures as non-transient and skip retry loops until capacity is restored.",
-        ]
-    if mode == "permission_failure":
-        return [
-            "Restore read permissions for the backup service principal on the affected storage path.",
-            "Audit the recent policy change and roll back least-privilege scope reductions that removed required actions.",
-            "Add a preflight authorization check before restore jobs start.",
-        ]
-    if mode == "network_timeout":
-        return [
-            "Stabilize the failing network path (tunnel flap/packet loss) before rerunning the restore.",
-            "Tune timeout and retry policies for intermittent transport instability.",
-            "Add targeted alerts for ETIMEDOUT/ENETUNREACH/ECONNRESET spikes on backup traffic.",
-        ]
-    if mode == "service_unavailable":
-        return [
-            "Coordinate with the dependency owner to schedule maintenance windows outside backup execution.",
-            "Keep backoff-retry behavior for transient 503 outages and alert when outage duration exceeds retry budget.",
-            "Add dependency health prechecks before starting large upload phases.",
-        ]
-    if mode == "clock_skew":
-        return [
-            "Repair host time synchronization (NTP) on the backup nodes before the next signed request.",
-            "Add clock-skew drift alerts with thresholds below the storage signature tolerance window.",
-            "Force a time-sync validation precheck before backup upload signing.",
-        ]
-    if mode == "partial_failure":
-        return [
-            "Isolate failed child tasks and re-run only the failed volumes instead of the entire job.",
-            "Review non-retryable network reset policy for hard connection resets on parallel task workers.",
-            "Track per-task success/failure metrics so partial outcomes trigger explicit remediation workflows.",
-        ]
-    if mode == "corruption":
-        return [
-            "Verify repository integrity and repair or recreate corrupted packs before rerunning the job.",
-            "Check for disk or storage path issues that may be truncating writes or corrupting blob data.",
-            "Add integrity checks earlier so corruption is surfaced before the terminal backup step.",
-        ]
-    if mode == "generic_fatal":
-        return [
-            "Inspect the fatal line together with the immediately surrounding log lines for the missing failure family.",
-            "Preserve raw restic stderr/plaintext output so generic fatal lines are not lost during normalization.",
-            "Add richer fatal-line heuristics for unknown-but-failing events.",
-        ]
-    return [
-        "Review the most recent non-terminal error event and its upstream dependencies.",
-        "Add targeted alerts around repeated WARN/ERROR patterns preceding terminal job outcomes.",
-        "Capture richer component diagnostics at failure boundaries to improve deterministic classification.",
-    ]
-
-
 def _root_cause_text(mode: str, causal_event: Optional[TimelineEntryContext]) -> str:
-    event_detail = ""
     if causal_event is not None:
-        code = causal_event.error_code or "NO_CODE"
-        event_detail = (
-            f" Most likely causal event: {causal_event.component} {code} at {causal_event.timestamp}."
-        )
+        observation = _extract_http_failure_observation(causal_event.message)
+        if observation is not None and "HTTP 401 Unauthorized" in observation:
+            return observation + " The rejecting service and exact identity failure mode could not be determined from the supplied evidence."
+
     if mode == "quota_exhaustion":
-        return (
-            "Destination storage capacity was exhausted during upload, causing a non-transient quota failure."
-            + event_detail
-        )
+        return "Observed storage capacity or quota exhaustion interrupted the operation."
     if mode == "permission_failure":
-        return (
-            "Restore access failed due to authorization scope/permission denial on storage reads."
-            + event_detail
-        )
+        return "Observed authorization or permission denial interrupted the operation."
     if mode == "network_timeout":
-        return (
-            "Restore failed because transport instability caused repeated network timeout/unreachable errors."
-            + event_detail
-        )
+        return "Observed network timeout or unreachable transport errors interrupted the operation."
     if mode == "service_unavailable":
-        return (
-            "A dependency service outage (503/unavailable) interrupted processing; retries indicate transient dependency failure."
-            + event_detail
-        )
+        return "Observed service outage or service-unavailable responses interrupted the operation."
     if mode == "clock_skew":
-        return (
-            "Signed requests were rejected because producer and storage clocks were outside the allowed skew window."
-            + event_detail
-        )
+        return "Observed clock skew caused signed requests to be rejected."
     if mode == "partial_failure":
-        return (
-            "Parallel volume processing ended in partial failure: at least one child task failed while others succeeded."
-            + event_detail
-        )
+        return "Observed partial failure after one or more child tasks failed."
+    if mode == "resource_access_failure":
+        observed_cause = (getattr(causal_event, "observed_cause", None) or "").strip() if causal_event is not None else ""
+        if causal_event is not None and "object info" in causal_event.message.lower():
+            if observed_cause:
+                return f"The service could not read object metadata because the underlying system returned {observed_cause}."
+            return "The service could not read object metadata because the underlying system returned a low-level resource-access error."
+        if observed_cause:
+            return f"The service could not access a required resource because the underlying system returned {observed_cause}."
+        return "The service could not access a required resource because the underlying system returned a low-level resource-access error."
     if mode == "corruption":
-        return (
-            "Repository or blob corruption was detected, preventing the backup from completing successfully."
-            + event_detail
-        )
+        return "Observed repository or blob corruption before the operation failed."
+    if causal_event is not None:
+        semantic_code = (_canonical_error_code(causal_event) or "").upper()
+        cause_type = (getattr(causal_event, "cause_type", None) or "").upper()
+
+        if semantic_code == "QUOTA_EXCEEDED" or cause_type == "STORAGE_CAPACITY":
+            return "The selected evidence shows that a storage-capacity failure interrupted the operation."
+        if semantic_code == "LOCK_OR_CONCURRENCY_FAILURE" or cause_type == "LOCK_OR_CONCURRENCY":
+            return "The selected evidence shows that a lock-refresh failure interrupted the operation."
+        if semantic_code in {"ACCESS_DENIED", "PERMISSION_DENIED", "UNAUTHORIZED"}:
+            return "The selected evidence shows an access-denied response, but the rejecting service and exact identity failure mode could not be determined from the supplied evidence."
+        if semantic_code == "RESOURCE_ACCESS_FAILURE" or cause_type == "RESOURCE_ACCESS":
+            observed_cause = (getattr(causal_event, "observed_cause", None) or "").strip()
+            if "object info" in causal_event.message.lower() and observed_cause:
+                return f"The service could not read object metadata because the underlying system returned {observed_cause}."
+            if observed_cause:
+                return f"The service could not access a required resource because the underlying system returned {observed_cause}."
     if mode == "generic_fatal":
         if causal_event is not None:
-            fatal_text = _raw_line_text(causal_event)
-            return f"A fatal error interrupted processing: {fatal_text}" + event_detail
-        return (
-            "A fatal error interrupted processing before a more specific failure family could be determined."
-            + event_detail
-        )
+            concise_message = _concise_observed_message(causal_event.message)
+            if concise_message:
+                return f"The selected evidence shows: {concise_message}"
+        return "The selected evidence shows a fatal failure, but the available evidence does not support a more specific causal attribution."
     return "The timeline shows repeated error activity preceding the final job outcome, but the dominant failure class is inconclusive."
 
 
@@ -917,53 +1388,577 @@ def _compute_confidence(
    return round(confidence, 2), rounded_breakdown, explanation
 
 
-def _generate_fallback_summary(context: InvestigationContext) -> InvestigationSummary:
+def select_investigation_evidence(context: InvestigationContext) -> InvestigationEvidence:
+   entries = context.recovery_timeline
+   mode, matched_entries, all_collections, rule_scores = _classify_failure_mode(context)
+   terminal_sequence = _find_terminal_sequence(entries)
+   terminal_entries = [entry for entry in entries if _is_terminal_outcome_event(entry)]
+   if not terminal_entries and terminal_sequence is not None:
+       terminal_entries = [entry for entry in entries if entry.sequence == terminal_sequence]
+
+   candidate_pool = [entry for entry in entries if not _is_progress_noise(entry)]
+   causal_candidates = [entry for entry in candidate_pool if _is_direct_causal_signal(entry)]
+   if causal_candidates:
+       primary_entry = max(
+           causal_candidates,
+           key=lambda entry: (_semantic_causal_strength(entry), -entry.sequence),
+       )
+   elif candidate_pool:
+       primary_entry = max(
+           candidate_pool,
+           key=lambda entry: (_primary_candidate_score(entry), -entry.sequence),
+       )
+   else:
+       primary_entry = _latest_causal_event(matched_entries, terminal_sequence)
+   if primary_entry is None and terminal_entries:
+       primary_entry = terminal_entries[-1]
+
+   selected_entries: list[tuple[TimelineEntryContext, str]] = []
+   seen_signatures: set[tuple[str, str, str, str]] = set()
+
+   def add_entry(entry: TimelineEntryContext, role: str) -> None:
+       signature = _evidence_signature(entry)
+       if signature in seen_signatures or _is_progress_noise(entry):
+           return
+       seen_signatures.add(signature)
+       selected_entries.append((entry, role))
+
+   for entry in entries:
+       if _is_progress_noise(entry):
+           continue
+       if primary_entry is not None and entry.sequence == primary_entry.sequence:
+           add_entry(entry, "PRIMARY_CAUSE")
+           continue
+       if _is_outcome_signal(entry):
+           add_entry(entry, "OUTCOME")
+           continue
+       if _is_explicit_propagation_signal(entry) and primary_entry is not None and entry.sequence > primary_entry.sequence:
+           add_entry(entry, "PROPAGATION")
+           continue
+       if _is_direct_causal_signal(entry):
+           add_entry(entry, "CONTRIBUTING")
+           continue
+       if entry.level == "INFO":
+           add_entry(entry, "CONTEXT")
+       elif entry.level in {"WARN", "ERROR"} or entry.error_code or _is_failure_related(entry):
+           add_entry(entry, "CONTRIBUTING")
+       else:
+           add_entry(entry, "CONTEXT")
+
+   causal_items: list[EvidenceItem] = []
+   context_items: list[EvidenceItem] = []
+   supporting_items: list[EvidenceItem] = []
+   outcome_items: list[EvidenceItem] = []
+   causal_chain: list[EvidenceItem] = []
+   primary_item: Optional[EvidenceItem] = None
+
+   for entry, role in sorted(selected_entries, key=lambda pair: pair[0].sequence):
+       item = _evidence_item(entry, role=role, mode=mode)
+       causal_chain.append(item)
+       if role == "CONTEXT":
+           context_items.append(item)
+           supporting_items.append(item)
+       elif role == "PRIMARY_CAUSE":
+           causal_items.append(item)
+           primary_item = item
+       elif role == "OUTCOME":
+           outcome_items.append(item)
+           supporting_items.append(item)
+       else:
+           causal_items.append(item)
+           supporting_items.append(item)
+
+   limitations: list[str] = []
+   if primary_item is None:
+       limitations.append("No defensible primary causal event could be isolated from the available evidence.")
+   if primary_item is not None and any(
+       item.role == "CONTRIBUTING" and item.sequence is not None and primary_item.sequence is not None and item.sequence < primary_item.sequence
+       for item in causal_chain
+   ):
+       limitations.append("The logs do not prove that the earlier file-access conflict caused the lock-refresh failure.")
+   if any(item.timestamp_source not in {"available", "parsed"} for item in causal_chain):
+       limitations.append("Observed timestamps are missing for part of the evidence; event order is preserved from ingestion sequence.")
+   source_documents = {item.source_file for item in causal_chain if item.source_file}
+   if len(source_documents) == 1 and causal_chain:
+       limitations.append("The investigation is based on a single source document.")
+   elif len({item.component for item in causal_chain}) == 1 and causal_chain:
+       limitations.append("Evidence is concentrated in a single component.")
+   if primary_item is not None:
+       primary_text = primary_item.message.lower()
+       primary_code = (primary_item.semantic_error_code or "").upper()
+       if "401" in primary_text or "unauthorized" in primary_text or primary_code in {"ACCESS_DENIED", "PERMISSION_DENIED", "UNAUTHORIZED"}:
+           limitations.append("The evidence contains an explicit HTTP 401 Unauthorized signal.")
+           limitations.append("The rejecting service could not be determined from the supplied evidence.")
+           limitations.append("No corroborating gateway, authentication, or target-service logs were supplied.")
+           limitations.append("The evidence does not establish whether the failure was authentication, authorization policy, token expiry, gateway enforcement, or another identity issue.")
+       if primary_code == "RESOURCE_ACCESS_FAILURE":
+           limitations.append("The supplied evidence does not establish whether the underlying problem was filesystem state, device failure, process descriptor state, or an operating-system issue.")
+
+   competing_scores = sorted(
+       (score for family, score in rule_scores.items() if family != mode and score > 0),
+       reverse=True,
+   )
+   if competing_scores and rule_scores.get(mode, 0) - competing_scores[0] <= 1:
+       limitations.append("A competing failure family is nearly as plausible as the selected cause.")
+
+   confidence, confidence_breakdown, confidence_explanation = _compute_confidence(
+       mode=mode,
+       matched_entries=matched_entries,
+       causal_event=primary_entry,
+       all_collections=all_collections,
+       rule_scores=rule_scores,
+       terminal_entries=terminal_entries,
+   )
+
+   confidence_inputs = {
+       "causal_count": float(len(causal_items)),
+       "context_count": float(len(context_items)),
+       "supporting_count": float(len(supporting_items)),
+       "outcome_count": float(len(outcome_items)),
+       "limitations_count": float(len(limitations)),
+       "matched_count": float(len(matched_entries)),
+   }
+
+   return InvestigationEvidence(
+       failure_mode=mode,
+       root_cause=_root_cause_text(mode, primary_entry),
+       context_events=context_items,
+       causal_events=causal_items,
+       outcome_events=outcome_items,
+       supporting_events=supporting_items,
+       limitations=limitations,
+       primary_causal_event=primary_item,
+       causal_chain=causal_chain,
+       confidence_inputs=confidence_inputs,
+       confidence=confidence,
+       confidence_breakdown=confidence_breakdown,
+       confidence_explanation=confidence_explanation,
+   )
+
+
+def _build_report_supporting_evidence(evidence: InvestigationEvidence) -> list[SupportingEvidenceItem]:
+    supporting_items: list[SupportingEvidenceItem] = []
+    seen_event_ids: set[str] = set()
+    for item in evidence.supporting_events:
+        if evidence.primary_causal_event is not None and item.event_id == evidence.primary_causal_event.event_id:
+            continue
+        if item.event_id in seen_event_ids:
+            continue
+        seen_event_ids.add(item.event_id)
+        supporting_items.append(
+            SupportingEvidenceItem(
+                event_id=item.event_id,
+                role=item.role,
+                display_summary=item.display_summary or item.summary or item.message,
+                why_it_matters=item.display_detail or item.summary or item.message,
+                source_document_id=item.source_file,
+            )
+        )
+    if not supporting_items and evidence.causal_chain:
+        for item in evidence.causal_chain:
+            if evidence.primary_causal_event is not None and item.event_id == evidence.primary_causal_event.event_id:
+                continue
+            if item.event_id in seen_event_ids:
+                continue
+            seen_event_ids.add(item.event_id)
+            supporting_items.append(
+                SupportingEvidenceItem(
+                    event_id=item.event_id,
+                    role=item.role,
+                    display_summary=item.display_summary or item.summary or item.message,
+                    why_it_matters=item.display_detail or item.summary or item.message,
+                    source_document_id=item.source_file,
+                )
+            )
+    return supporting_items
+
+
+def _build_report_timeline_items(evidence: InvestigationEvidence) -> list[TimelineReportItem]:
+    items: list[TimelineReportItem] = []
+    for finding_index, group in enumerate(group_evidence_for_timeline(evidence), start=1):
+        representative = group.items[0] if group.items else None
+        detail_items = [
+            TimelineFindingDetail(
+                event_id=item.event_id,
+                role=item.role,
+                timestamp=item.timestamp,
+                timestamp_source=item.timestamp_source,
+                time=_format_report_timestamp(item.timestamp, item.timestamp_source),
+                display_summary=item.display_summary or item.summary or item.message,
+                display_detail=item.display_detail or item.summary or item.message,
+                source=item.component,
+                component_id=item.component,
+                component_name=item.component,
+                source_document_id=item.source_file,
+            )
+            for item in group.items
+        ]
+        display_detail = group.summary
+        if len(group.items) > 1:
+            display_detail = f"{group.summary} ({len(group.items)} supporting observations.)"
+        items.append(
+            TimelineReportItem(
+                event_id=representative.event_id if representative is not None else f"finding-{finding_index}",
+                role=representative.role if representative is not None else "CONTEXT",
+                title=group.title,
+                finding_type=group.finding_type,
+                stage=group.stage,
+                timestamp=representative.timestamp if representative is not None else None,
+                timestamp_source=representative.timestamp_source if representative is not None else None,
+                time=_format_report_timestamp(representative.timestamp, representative.timestamp_source) if representative is not None else "Timestamp unavailable",
+                display_summary=group.title,
+                display_detail=display_detail,
+                source=representative.component if representative is not None else "investigation",
+                component_id=representative.component if representative is not None else "investigation",
+                component_name=representative.component if representative is not None else "Investigation",
+                source_document_id=representative.source_file if representative is not None else None,
+                supporting_evidence_count=len(group.items) if group.items else len(group.underlying_evidence_ids),
+                underlying_evidence_ids=list(group.underlying_evidence_ids),
+                detail_items=detail_items,
+            )
+        )
+    return items
+
+
+def _derive_customer_impact(evidence: InvestigationEvidence, scenario: Scenario) -> str:
+    if evidence.outcome_events:
+        outcome = evidence.outcome_events[-1]
+        if outcome.role == "OUTCOME" and outcome.display_detail:
+            return outcome.display_detail
+    if evidence.primary_causal_event is not None:
+        observation = _extract_http_failure_observation(evidence.primary_causal_event.message)
+        if observation is not None:
+            if "PUT request" in observation:
+                return "The downstream PUT request did not complete successfully. Broader job or customer impact could not be determined from the supplied evidence."
+            return "The observed downstream request did not complete successfully. Broader job or customer impact could not be determined from the supplied evidence."
+    return "Broader job or customer impact could not be determined from the supplied evidence."
+
+
+def _primary_causal_label(evidence: InvestigationEvidence) -> str:
+    primary = evidence.primary_causal_event
+    if primary is None:
+        return "No defensible primary causal event"
+
+    if (primary.semantic_error_code or "").upper() == "RESOURCE_ACCESS_FAILURE":
+        if "object info" in primary.message.lower():
+            return "Object metadata access failure"
+        return "Resource access failure"
+
+    semantic_bits: list[str] = []
+    for value in (primary.cause_type, primary.event_type, primary.semantic_error_code, primary.error_code):
+        if isinstance(value, str) and value.strip():
+            cleaned = _humanize_identifier(value)
+            if cleaned and cleaned.upper() not in {"UNKNOWN", "NO CODE", "UNKNOWN CODE", "RAW UNPARSED"}:
+                semantic_bits.append(cleaned)
+
+    if semantic_bits:
+        return semantic_bits[0]
+    if primary.display_summary:
+        return _generic_sentence(primary.display_summary)
+    return _generic_sentence(primary.message) or "Primary causal signal"
+
+
+def _observed_failure_text(evidence: InvestigationEvidence) -> str:
+    primary = evidence.primary_causal_event
+    if primary is None:
+        return "No direct causal event was isolated from the supplied evidence."
+
+    if (primary.semantic_error_code or "").upper() == "RESOURCE_ACCESS_FAILURE":
+        if primary.display_summary:
+            return _generic_sentence(primary.display_summary)
+        if "object info" in primary.message.lower():
+            return "Object metadata access failed."
+        return "Resource access failed."
+
+    if primary.display_summary:
+        return _generic_sentence(primary.display_summary)
+
+    concise = _concise_observed_message(primary.message)
+    if concise:
+        return concise
+    return _generic_sentence(primary.message) or "Failure signal observed in the primary causal event."
+
+
+def _inferred_explanation_text(evidence: InvestigationEvidence) -> str:
+    root = (evidence.root_cause or "").strip()
+    if not root:
+        return "No evidence-grounded explanation could be inferred from the supplied timeline."
+    return root
+
+
+def _evidence_gap_lines(evidence: InvestigationEvidence) -> list[str]:
+    gaps: list[str] = []
+    for limitation in evidence.limitations:
+        normalized = limitation.removeprefix("•").removeprefix("✓").strip()
+        if not normalized:
+            continue
+        lower = normalized.lower()
+        if any(
+            token in lower
+            for token in (
+                "could not",
+                "does not",
+                "missing",
+                "single source",
+                "unavailable",
+                "not establish",
+                "not prove",
+                "competing",
+                "inconclusive",
+                "could not be isolated",
+            )
+        ):
+            if normalized not in gaps:
+                gaps.append(normalized)
+    return gaps
+
+
+def _action_category(action: str) -> str:
+    text = action.lower()
+    if any(token in text for token in ("retry", "restore", "increase", "repair", "stabilize", "isolate", "rollback", "roll back", "prune", "clear")):
+        return "Immediate mitigation"
+    if any(token in text for token in ("inspect", "search", "verify", "confirm", "identify", "logs", "trace", "collect", "correlate")):
+        return "Immediate investigation"
+    return "Preventive improvement"
+
+
+def _action_rationale(action: str, evidence: InvestigationEvidence, evidence_gaps: list[str]) -> str:
+    category = _action_category(action)
+    if category == "Immediate investigation":
+        if evidence_gaps:
+            return "Addresses unresolved evidence gaps before attributing a narrower cause."
+        return "Validates the observed failure with directly related component evidence."
+    if category == "Immediate mitigation":
+        if evidence.primary_causal_event is not None and evidence.primary_causal_event.display_summary:
+            return f"Targets the observed primary failure signal: {evidence.primary_causal_event.display_summary}"
+        return "Attempts to restore service after the observed failure condition."
+    return "Reduces recurrence risk by hardening controls around the observed failure mode."
+
+
+def _recommended_actions_view(actions: list[str], evidence: InvestigationEvidence, evidence_gaps: list[str]) -> list[RecommendedActionView]:
+    output: list[RecommendedActionView] = []
+    for action in _dedupe_actions(actions):
+        output.append(
+            RecommendedActionView(
+                category=_action_category(action),
+                action=action,
+                rationale=_action_rationale(action, evidence, evidence_gaps),
+            )
+        )
+    return output
+
+
+def _confidence_dimension_level(value: float, *, penalty: bool = False) -> str:
+    if penalty:
+        if value <= -0.15:
+            return "High"
+        if value < 0:
+            return "Medium"
+        return "Low"
+    if value >= 0.16:
+        return "High"
+    if value >= 0.08:
+        return "Medium"
+    if value > 0:
+        return "Low"
+    return "Unknown"
+
+
+def _confidence_dimension_rationale(key: str, value: float, evidence: InvestigationEvidence) -> str:
+    if key == "causal_signal":
+        if evidence.primary_causal_event is not None:
+            return "Primary causal event was selected from non-terminal evidence."
+        return "No non-terminal primary causal event was isolated."
+    if key == "corroboration":
+        components = {item.component for item in evidence.causal_chain if item.role in {"PRIMARY_CAUSE", "CONTRIBUTING", "OUTCOME"}}
+        return f"Corroboration observed across {len(components)} component(s)."
+    if key == "temporal_coherence":
+        return "Ordering of warning/error signals relative to terminal outcome supports the inferred chain."
+    if key == "consistency":
+        return "Failure-family consistency reflects how strongly evidence aligns to one mode."
+    if key == "ambiguity_penalty":
+        if value < 0:
+            return "Competing hypotheses reduce certainty for the selected explanation."
+        return "No strong competing hypothesis reduced certainty."
+    return "Confidence contribution derived from selected evidence."
+
+
+def _confidence_dimensions_view(evidence: InvestigationEvidence) -> list[ConfidenceDimensionView]:
+    labels = {
+        "causal_signal": "Causal signal",
+        "corroboration": "Cross-component corroboration",
+        "temporal_coherence": "Temporal coherence",
+        "consistency": "Failure-family consistency",
+        "ambiguity_penalty": "Ambiguity penalty",
+    }
+    dimensions: list[ConfidenceDimensionView] = []
+    for key in ("causal_signal", "corroboration", "temporal_coherence", "consistency", "ambiguity_penalty"):
+        value = float(evidence.confidence_breakdown.get(key, 0.0))
+        dimensions.append(
+            ConfidenceDimensionView(
+                dimension=labels[key],
+                level=_confidence_dimension_level(value, penalty=(key == "ambiguity_penalty")),
+                rationale=_confidence_dimension_rationale(key, value, evidence),
+            )
+        )
+    return dimensions
+
+
+def _build_report_actions(actions: list[str]) -> tuple[list[str], list[str]]:
+    immediate: list[str] = []
+    preventive: list[str] = []
+    for action in actions:
+        text = action.lower()
+        if any(token in text for token in ("retry", "restore", "increase", "stabilize", "repair", "re-run", "isolate", "roll back", "inspect", "search", "verify", "confirm")):
+            immediate.append(action)
+        else:
+            preventive.append(action)
+    if not immediate and actions:
+        immediate = actions[:1]
+        preventive = actions[1:]
+    return immediate, preventive
+
+
+def _dedupe_actions(actions: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for action in actions:
+        key = action.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(action)
+    return deduped
+
+
+def _report_actions_from_evidence(
+    evidence: InvestigationEvidence,
+    context: InvestigationContext,
+) -> list[str]:
+    primary = evidence.primary_causal_event
+    primary_text = (primary.message if primary is not None else "").lower()
+    semantic_code = (primary.semantic_error_code if primary is not None and primary.semantic_error_code else "").upper()
+    cause_type = (primary.cause_type if primary is not None and primary.cause_type else "").upper()
+
+    if "401" in primary_text or "unauthorized" in primary_text:
+        return [
+            "Inspect gateway, identity-provider, and target-service logs for the rejected request.",
+            "Search by endpoint, caller identity, request ID, or the surrounding time window to identify the rejecting service.",
+            "Verify the credentials or token used by the request and confirm the expected scope or policy.",
+        ]
+
+    if evidence.failure_mode and evidence.failure_mode != "generic_fatal":
+        return _evidence_grounded_actions(evidence.failure_mode, context.recovery_timeline)
+
+    if semantic_code == "RESOURCE_ACCESS_FAILURE" or cause_type == "RESOURCE_ACCESS":
+        return _evidence_grounded_actions("resource_access_failure", context.recovery_timeline)
+
+    if semantic_code == "QUOTA_EXCEEDED" or cause_type == "STORAGE_CAPACITY" or "no space left" in primary_text:
+        return [
+            "Increase destination storage capacity or prune old backup artifacts before the next run.",
+            "Confirm the failing write or upload path has sufficient free space before retrying.",
+            "Add earlier capacity alerts so non-transient quota failures are detected before upload begins.",
+        ]
+
+    if semantic_code == "LOCK_OR_CONCURRENCY_FAILURE" or cause_type == "LOCK_OR_CONCURRENCY" or "refresh lock" in primary_text:
+        return [
+            "Inspect repository-lock or lock-manager logs around the failed refresh window.",
+            "Verify whether another writer or a stale lock prevented the operation from completing.",
+            "Retry only after confirming the conflicting lock holder or stale lock condition has been cleared.",
+        ]
+
+    return _evidence_grounded_actions(evidence.failure_mode or "generic_fatal", context.recovery_timeline)
+
+
+def build_investigation_report_view(
+    evidence: InvestigationEvidence,
+    summary: InvestigationSummary,
+    scenario: Scenario,
+    timeline: Any,
+) -> InvestigationReportView:
+    evidence_gaps = _evidence_gap_lines(evidence)
+    recommended_actions = _recommended_actions_view(summary.next_actions, evidence, evidence_gaps)
+    immediate_actions = [item.action for item in recommended_actions if item.category in {"Immediate investigation", "Immediate mitigation"}]
+    preventive_actions = [item.action for item in recommended_actions if item.category == "Preventive improvement"]
+    if not immediate_actions and summary.next_actions:
+        immediate_actions, preventive_actions = _build_report_actions(summary.next_actions)
+    confidence_level = "High" if evidence.confidence >= 0.75 else "Medium" if evidence.confidence >= 0.4 else "Low"
+    return InvestigationReportView(
+        status="Completed",
+        incident_summary=_build_incident_summary_view(scenario, timeline),
+        root_cause=evidence.root_cause,
+        observed_failure=_observed_failure_text(evidence),
+        inferred_explanation=_inferred_explanation_text(evidence),
+        evidence_gaps=evidence_gaps,
+        primary_causal_label=_primary_causal_label(evidence),
+        primary_causal_event=evidence.primary_causal_event,
+        outcome_summary=evidence.outcome_events[-1].display_summary if evidence.outcome_events else None,
+        customer_impact=_derive_customer_impact(evidence, scenario),
+        timeline_items=_build_report_timeline_items(evidence),
+        supporting_evidence=_build_report_supporting_evidence(evidence),
+        evidence_limitations=evidence.limitations,
+        immediate_actions=immediate_actions,
+        preventive_actions=preventive_actions,
+        confidence=evidence.confidence,
+        confidence_level=confidence_level,
+        confidence_explanation=_report_confidence_explanation(evidence),
+        confidence_dimensions=_confidence_dimensions_view(evidence),
+        recommended_actions=recommended_actions,
+    )
+
+
+def _generate_fallback_summary(
+    context: InvestigationContext,
+    evidence: Optional[InvestigationEvidence] = None,
+) -> InvestigationSummary:
     """Generate a deterministic, evidence-based investigation summary from timeline context only."""
-    entries = context.recovery_timeline
-    mode, matched_entries, all_collections, rule_scores = _classify_failure_mode(context)
-    terminal_sequence = _find_terminal_sequence(entries)
-    causal_event = _latest_causal_event(matched_entries, terminal_sequence)
-    terminal_entries = [entry for entry in entries if _is_terminal_outcome_event(entry)]
+    evidence = evidence or select_investigation_evidence(context)
+    supporting_text = [evidence.root_cause]
+    for item in evidence.causal_chain[-3:]:
+        detail = item.message
+        if item.summary and item.summary != item.message:
+            supporting_text.append(f"{item.summary} — {detail}")
+        else:
+            supporting_text.append(detail)
 
-    evidence: list[str] = []
-    for entry in matched_entries[-3:]:
-        evidence.append(_build_evidence_line(entry))
+    if evidence.primary_causal_event is not None:
+        primary_detail = evidence.primary_causal_event.message
+        if evidence.primary_causal_event.summary and evidence.primary_causal_event.summary != primary_detail:
+            supporting_text.insert(
+                0,
+                f"Causal candidate: {evidence.primary_causal_event.summary} — {primary_detail}",
+            )
+        else:
+            supporting_text.insert(0, f"Causal candidate: {primary_detail}")
 
-    if causal_event is not None:
-        evidence.insert(0, f"Causal candidate: {_build_evidence_line(causal_event)}")
+    if evidence.outcome_events:
+        supporting_text.append(
+            f"Outcome evidence: {evidence.outcome_events[-1].message}"
+        )
 
-    if terminal_entries:
-        evidence.append(f"Outcome evidence: {_build_evidence_line(terminal_entries[-1])}")
-
-    if not evidence and entries:
-        evidence = [
-            _build_evidence_line(entries[-1]),
+    if not supporting_text and evidence.causal_chain:
+        supporting_text = [
+            evidence.causal_chain[-1].message,
             "No stronger classified signal was found before the terminal outcome.",
         ]
 
-    confidence, confidence_breakdown, confidence_explanation = _compute_confidence(
-        mode=mode,
-        matched_entries=matched_entries,
-        causal_event=causal_event,
-        all_collections=all_collections,
-        rule_scores=rule_scores,
-        terminal_entries=terminal_entries,
-    )
-
     return InvestigationSummary(
-        likely_root_cause=_root_cause_text(mode, causal_event),
-        supporting_evidence=evidence[:5],
-        next_actions=_evidence_grounded_actions(mode, matched_entries),
-        confidence=confidence,
-        confidence_breakdown=confidence_breakdown,
-        confidence_explanation=confidence_explanation,
+        likely_root_cause=evidence.root_cause,
+        supporting_evidence=supporting_text[:5],
+        next_actions=_report_actions_from_evidence(evidence, context),
+        confidence=evidence.confidence,
+        confidence_breakdown=evidence.confidence_breakdown,
+        confidence_explanation=evidence.confidence_explanation,
+        evidence=evidence,
     )
 
 
 def generate_simulated_investigation_summary(
     context: InvestigationContext,
+    evidence: Optional[InvestigationEvidence] = None,
 ) -> InvestigationSummary:
-    return _generate_fallback_summary(context)
+    selected_evidence = evidence or select_investigation_evidence(context)
+    return _generate_fallback_summary(context, selected_evidence)
 
 
 def generate_llm_investigation_summary(

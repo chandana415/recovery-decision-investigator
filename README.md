@@ -1,121 +1,184 @@
 # Recovery Decision Investigator
 
-AI-assisted investigation for enterprise backup and recovery incidents.
+An AI-assisted investigation platform for enterprise backup and recovery incidents.
 
-Recovery Decision Investigator is a deterministic-first investigation tool that reconstructs the evidence chain for a recovery job, identifies the most likely root cause, and recommends next actions with an explainable confidence score.
+Recovery Decision Investigator reconstructs operational evidence, identifies the most likely causal event, explains what the available evidence supports (and what it does not), and recommends evidence-based next actions with an explainable confidence score.
 
-It is designed for incident-response workflows where reliability, transparency, and reproducibility matter more than a black-box model.
+Unlike traditional log summarizers, the system separates:
 
-## What the project does
+- Observed failures
+- Inferred explanations
+- Evidence gaps
+- Investigation confidence
 
-Given a recovery job or incident scenario, the app:
+This enables engineers to understand not only what likely happened, but also the limits of the available evidence before taking action.
 
-- parses raw event and log data
-- normalizes it into a common schema
-- reconstructs a chronological evidence timeline
-- classifies likely root causes
-- scores confidence based on evidence quality
-- recommends next actions
-- optionally enriches the result with an LLM-generated narrative
+The investigation engine is deterministic-first. AI is optional and used only to improve narrative explanations—not to replace the investigation logic.
 
-This is not an automated remediation system. It investigates and recommends, but it does not execute fixes.
+---
 
-## Implemented phases
+# What the project does
 
-### Phase 1 — Evidence ingestion and normalization
-Implemented in the core parsing layer.
+Given uploaded operational logs or a recovery scenario, the application:
 
-- ingest backup, storage, and monitoring-style events
-- parse JSON-based synthetic scenarios from the mock-data directory
-- normalize timestamps, identifiers, and error fields into a shared model
-- validate incoming log payloads and scenario structure
+- ingests structured and unstructured operational logs
+- detects document structure across multiple log formats
+- normalizes heterogeneous events into a common evidence model
+- reconstructs an investigation timeline
+- derives semantic failure classifications
+- identifies the most likely causal event
+- distinguishes observed failures from inferred explanations
+- highlights evidence gaps and investigation limitations
+- computes an explainable confidence score
+- recommends evidence-based next actions
+- optionally generates an LLM-assisted investigation summary
 
-### Phase 2 — Deterministic investigation engine
-Implemented in the investigation workflow.
+This is **not** an automated remediation system. It investigates and recommends, but never executes corrective actions.
 
-- reconstruct an evidence timeline from parsed events
-- detect warning and error patterns across components
-- identify likely causal events and terminal outcomes
-- score confidence using evidence strength, corroboration, temporal coherence, and consistency
-- generate supporting evidence and next-action recommendations
+---
 
-### Phase 3 — Interactive investigation experience
-Implemented as a Streamlit application.
+# Investigation philosophy
 
-- search and review incident scenarios by job ID
-- inspect investigation summaries, evidence timelines, and findings
-- review recommended actions and confidence explanations
-- load demo scenarios without any external dependencies
+The platform follows a deterministic-first investigation pipeline.
 
-### Phase 4 — Upload and live AI support
-Implemented in the current repository state.
+Rather than asking an LLM to infer root cause directly, the application:
 
-- upload custom log files for ad-hoc analysis
-- validate uploaded JSON or text-based content safely in memory
-- optionally enable Live OpenAI mode for richer narrative summaries
-- support deterministic fallback when live AI is unavailable
+1. Extracts operational evidence.
+2. Derives semantic meaning from heterogeneous logs.
+3. Reconstructs the investigation timeline.
+4. Evaluates evidence quality and confidence.
+5. Identifies evidence gaps and uncertainty.
+6. Produces an explainable investigation report.
+7. Optionally generates an AI-assisted narrative.
 
-### Phase 5 — Deployment readiness
-Implemented for local use and Streamlit Cloud-style deployment.
+This approach keeps investigations reproducible, explainable, and auditable.
 
-- local development workflow with Python and Streamlit
-- configuration for Streamlit app settings
-- environment and secrets handling for optional OpenAI usage
-- deployment documentation for cloud-based hosting
+---
 
-## Architecture overview
+# Architecture overview
 
 ```text
-Recovery Job / Scenario
-    │
-    ▼
-Evidence Ingestion
-    │
-    ▼
-Event Parsing and Normalization
-    │
-    ▼
-Timeline Reconstruction
-    │
-    ▼
-Deterministic Investigation
-    │
-    ▼
-(Optional Live AI Explanation)
-    │
-    ▼
-Investigation Report
+Uploaded Logs / Demo Scenario
+            │
+            ▼
+Document Detection
+            │
+            ▼
+Event Parsing & Normalization
+            │
+            ▼
+Semantic Classification
+            │
+            ▼
+Evidence Selection
+            │
+            ▼
+Investigation Engine
+            │
+            ▼
+Evidence Grouping
+            │
+            ▼
+Report Builder
+            │
+            ▼
+Streamlit UI
+                 │
+                 ▼
+(Optional AI Narrative)
 ```
 
-## Key features
+---
 
-- deterministic-first analysis
-- evidence-based confidence scoring
-- explainable root-cause reasoning
-- support for synthetic and uploaded scenarios
-- optional LLM-generated summaries
-- Streamlit-based user interface
+# Example investigation workflow
 
-## Running locally
+```text
+Upload Logs
+      │
+      ▼
+Normalize Events
+      │
+      ▼
+Derive Semantic Meaning
+      │
+      ▼
+Select Supporting Evidence
+      │
+      ▼
+Reconstruct Investigation
+      │
+      ▼
+Identify Evidence Gaps
+      │
+      ▼
+Generate Investigation Report
+```
+
+---
+
+# Key features
+
+- Deterministic-first investigation engine
+- Semantic normalization across heterogeneous logs
+- Evidence-based causal reasoning
+- Investigation timeline reconstruction
+- Explicit evidence-gap reporting
+- Explainable confidence scoring
+- Grouped investigation timeline
+- Analysis of uploaded operational logs
+- Optional AI-generated investigation narrative
+- Interactive Streamlit interface
+
+---
+
+# Running locally
 
 ```bash
 cd /path/to/workrepo
+
 python3 -m venv .venv
 source .venv/bin/activate
+
 pip install -r requirements.txt
+
 cp .env.example .env
+
 streamlit run recovery_workspace/app.py
 ```
 
-## Testing
+---
+
+# Running tests
 
 ```bash
-pytest -q
+python3 -m pytest -q
 ```
 
-## Current limitations
+---
 
-This project is under active development and has known gaps, surfaced through testing against real tool-generated logs (not synthetic mocks) rather than assumed. Documenting them here rather than only in commit history:
+# Current limitations
 
-- **Root-cause categorization and evidence scoring currently run through separate code paths.** In several cases the human-readable root-cause explanation correctly identified a failure category while the confidence score did not reflect it (or vice versa). Work is in progress to unify these into a single classification step.
-- **Failure-pattern detection is template-based and not fully generalized.** Detection currently relies on a hardcoded set of symptom phrases.
+The project is under active development.
+
+Current known limitations include:
+
+- Investigation quality depends on the evidence provided. Missing downstream service logs, trace IDs, timestamps, or cross-system telemetry reduce attribution confidence.
+
+- Cross-service correlation currently relies on uploaded evidence rather than live integrations with observability platforms.
+
+- Extremely noisy OCR output or heavily truncated logs may reduce semantic extraction quality.
+
+- Live OpenAI mode enhances investigation narratives only. Core investigation logic remains deterministic and fully functional without AI.
+
+---
+
+# Future roadmap
+
+Planned enhancements include:
+
+- Live integrations with enterprise observability platforms
+- Cross-service evidence correlation using distributed tracing
+- Investigation graph visualization
+- Multi-incident comparison
+- Interactive evidence exploration
+- Support for additional operational log formats

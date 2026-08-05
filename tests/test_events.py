@@ -3,6 +3,17 @@ from pathlib import Path
 from recovery_workspace.events import normalize_events
 from recovery_workspace.parser import parse_scenario
 
+
+def test_normalize_events_derives_semantic_fields_before_investigation_context():
+    scenario = parse_scenario(SCENARIO_PATH)
+    events = normalize_events(scenario.logs)
+
+    storage_event = next(event for event in events if event.component == "storage" and event.level == "ERROR")
+
+    assert storage_event.semantic_error_code == "QUOTA_EXCEEDED"
+    assert storage_event.cause_type == "STORAGE_CAPACITY"
+    assert storage_event.event_type == "TERMINAL_FAILURE"
+
 SCENARIO_PATH = (
     Path(__file__).parent.parent / "mock-data" / "scenarios" / "storage-quota-exceeded.json"
 )

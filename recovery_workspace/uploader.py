@@ -185,53 +185,686 @@ def _make_raw_log_entry(
             "parse_status": parse_status,
             "raw_line": line,
             "source_filename": source_filename,
+            "timestamp_source": "unavailable",
         },
     }
 
 
 def _interpolate_missing_timestamps(records: list[dict], default_start: Optional[datetime] = None) -> None:
-    known_indices = [i for i, record in enumerate(records) if isinstance(record.get("timestamp"), datetime)]
     if not records:
         return
 
-    if not known_indices:
-        base = default_start or datetime.now(timezone.utc).replace(microsecond=0)
-        for i, record in enumerate(records):
-            record["timestamp"] = (base + timedelta(seconds=i)).isoformat()
-        return
+    base = default_start or datetime.now(timezone.utc).replace(microsecond=0)
+    for index, record in enumerate(records):
+        structured_fields = record.setdefault("structuredFields", {})
+        if not isinstance(structured_fields, dict):
+            structured_fields = {}
+            record["structuredFields"] = structured_fields
 
-    for i, record in enumerate(records):
         if isinstance(record.get("timestamp"), datetime):
+            structured_fields.setdefault("timestamp_source", "parsed")
+            if record["timestamp"].tzinfo is None:
+                record["timestamp"] = record["timestamp"].replace(tzinfo=timezone.utc)
+        elif isinstance(record.get("timestamp"), str):
+            parsed = _parse_iso_timestamp(record["timestamp"])
+            if parsed is not None:
+                record["timestamp"] = parsed
+                structured_fields.setdefault("timestamp_source", "parsed")
+            else:
+                record["timestamp"] = base + timedelta(seconds=index)
+                structured_fields["timestamp_source"] = "missing"
+                structured_fields["ingestion_sequence"] = index
+        else:
+            record["timestamp"] = base + timedelta(seconds=index)
+            structured_fields["timestamp_source"] = "missing"
+            structured_fields["ingestion_sequence"] = index
+
+
+def _coerce_structured_value(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return value
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        return float(value)
+    return value
+
+
+def _extract_generic_level(fields: dict[str, Any], *, fallback: str = "INFO") -> str:
+    level = fields.get("level") or fields.get("severity") or fields.get("status")
+    if isinstance(level, str):
+        level_text = level.strip().upper()
+        if level_text in {"INFO", "WARN", "WARNING", "ERROR", "DEBUG"}:
+            return level_text if level_text != "WARNING" else "WARN"
+
+    for key in ("msg", "message", "summary", "reason"):
+        value = fields.get(key)
+        if isinstance(value, str):
+            value_text = value.lower()
+            if any(token in value_text for token in ("error", "failed", "failure", "fatal", "denied", "timeout", "cancelled", "critical")):
+                return "ERROR"
+            if any(token in value_text for token in ("warn", "warning", "degraded")):
+                return "WARN"
+    return fallback
+
+
+def _build_structural_event(
+    *,
+    source_filename: str,
+    file_correlation_id: str,
+    message: str,
+    level: str,
+    structured_fields: dict[str, Any],
+    timestamp: Optional[datetime] = None,
+    raw_line: str = "",
+    error_code: Optional[str] = None,
+    sequence: Optional[int] = None,
+) -> dict:
+    component = extract_component_from_filename(source_filename) if source_filename else "unknown"
+    timestamp_source = "parsed" if timestamp is not None else "missing"
+    if structured_fields.get("timestamp_source") in {"missing", "parsed", "sequence"}:
+        timestamp_source = structured_fields.get("timestamp_source") or timestamp_source
+    return {
+        "timestamp": timestamp,
+        "correlationId": file_correlation_id,
+        "componentId": component.lower(),
+        "component": component,
+        "level": level,
+        "errorCode": error_code,
+        "message": message,
+        "traceId": None,
+        "structuredFields": {
+            **structured_fields,
+            "raw_line": raw_line,
+            "source_filename": source_filename,
+            "timestamp_source": timestamp_source,
+        },
+    }
+
+
+def _score_key_value_lines(lines: list[str]) -> tuple[float, dict[str, Any]]:
+    meaningful_lines = 0
+    meaningful_fields = set()
+    assignment_count = 0
+    recognized_keys = {"time", "timestamp", "level", "msg", "message", "cause", "source", "stack"}
+    for line in lines:
+        if line.startswith("$") or line.startswith("#"):
+            continue
+        matches = list(re.finditer(r"(^|\s)([A-Za-z0-9_.-]+)\s*=", line))
+        if matches:
+            assignment_count += len(matches)
+            for key in recognized_keys:
+                if re.search(rf"\b{key}\s*=", line):
+                    meaningful_fields.add(key)
+            if re.search(r"\b(msg|message|cause|source|stack|level|time|timestamp)\s*=", line):
+                meaningful_lines += 1
+
+    if assignment_count < 2:
+        return 0.0, {"matched_lines": 0, "assignment_count": assignment_count, "meaningful_lines": 0, "meaningful_fields": []}
+
+    matched_ratio = meaningful_lines / max(1, len(lines))
+    field_ratio = len(meaningful_fields) / len(recognized_keys)
+    confidence = min(0.95, 0.2 + 0.35 * min(1.0, matched_ratio * 2.0) + 0.2 * field_ratio)
+    return confidence, {
+        "matched_lines": meaningful_lines,
+        "assignment_count": assignment_count,
+        "meaningful_lines": meaningful_lines,
+        "meaningful_fields": sorted(meaningful_fields),
+    }
+
+
+def _score_command_status_lines(lines: list[str]) -> tuple[float, dict[str, Any]]:
+    prompt_lines = sum(1 for line in lines if line.startswith("$"))
+    assignment_lines = sum(1 for line in lines if re.match(r"^[A-Za-z0-9_.-]+=", line))
+    summary_lines = sum(1 for line in lines if re.search(r"\b(state|summary|status|health|count|available|entity|section)\b", line, re.IGNORECASE))
+    section_lines = sum(1 for line in lines if re.search(r"^section\s*=", line, re.IGNORECASE))
+    state_lines = sum(1 for line in lines if re.search(r"^state\s*=", line, re.IGNORECASE))
+    metric_lines = sum(1 for line in lines if re.search(r"\b(count|available|total|used|down|up)\b", line, re.IGNORECASE))
+    confidence = 0.0
+    if prompt_lines:
+        confidence += 0.2
+    if assignment_lines:
+        confidence += 0.2
+    if summary_lines:
+        confidence += 0.2
+    if section_lines:
+        confidence += 0.15
+    if state_lines:
+        confidence += 0.15
+    if metric_lines:
+        confidence += 0.1
+    return min(0.95, confidence), {
+        "prompt_lines": prompt_lines,
+        "assignment_lines": assignment_lines,
+        "summary_lines": summary_lines,
+        "section_lines": section_lines,
+        "state_lines": state_lines,
+        "metric_lines": metric_lines,
+    }
+
+
+def _normalize_detection_token(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _is_timestamped_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return bool(
+        re.match(r"^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}", stripped)
+        or re.match(r"^\[\d{4}-\d{2}-\d{2}", stripped)
+        or re.match(r"^\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}", stripped)
+    )
+
+
+def _looks_like_exception_field(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    label = stripped.split(":", 1)[0].strip()
+    normalized_label = _normalize_detection_token(label)
+    if not normalized_label:
+        return False
+
+    recognized = {"level", "logger", "message", "thread", "throwable", "cause", "stack", "suppressed", "exception", "class", "trace", "error", "detail"}
+    if normalized_label in recognized:
+        return True
+    for token in recognized:
+        if normalized_label.startswith(token) or token.startswith(normalized_label):
+            return True
+    return False
+
+
+def _looks_like_frame_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if re.match(r"^(?:at|caused by|suppressed)\b", stripped, re.IGNORECASE):
+        return True
+    normalized = _normalize_detection_token(stripped)
+    if normalized.startswith("at") and len(normalized) > 2:
+        return True
+    if "causedby" in normalized or "suppressed" in normalized:
+        return True
+    if re.search(r"\b(?:class|method|file|line|trace)\b", stripped, re.IGNORECASE) and re.search(r"\d+", stripped):
+        return True
+    if re.search(r"\(", stripped) and re.search(r"\d+", stripped):
+        return True
+    return False
+
+
+def detect_document_type(content: str, source_filename: str = "") -> str:
+    if not content or not content.strip():
+        return "PLAINTEXT"
+
+    stripped = content.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            return "JSON"
+        if isinstance(obj, list):
+            return "JSON"
+        if isinstance(obj, dict) and "logs" in obj:
+            return "JSON"
+        return "JSON"
+
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if not lines:
+        return "PLAINTEXT"
+
+    if any(line.startswith("$") for line in lines) and any(re.search(r"\b(state|summary|health|count|available|entity|section)\b", line, re.IGNORECASE) for line in lines):
+        return "COMMAND_STATUS"
+
+    if len(lines) >= 2:
+        header_line = lines[0]
+        header_tokens = [token for token in re.split(r"\s{2,}|\s+", header_line) if token]
+        if len(header_tokens) >= 2 and any(token.lower() in {"first_seen", "last_seen", "count", "source", "reason", "message", "details"} for token in header_tokens):
+            return "TABULAR_REPORT"
+
+    timestamped_lines = sum(1 for line in lines if _is_timestamped_line(line))
+    frame_lines = [line for line in lines if _looks_like_frame_line(line)]
+    field_lines = [line for line in lines if _looks_like_exception_field(line)]
+    header_signal = any(re.search(r"\b(error|failed|unable|exception|fatal|timeout|denied|interrupted|unavailable)\b", line, re.IGNORECASE) for line in lines)
+    diagnostic_signal = any(re.search(r"\b(cause|throwable|suppressed|stack|trace|exception)\b", line, re.IGNORECASE) for line in lines)
+
+    score = 0
+    if header_signal:
+        score += 2
+    if field_lines:
+        score += min(3, len(field_lines))
+    if frame_lines:
+        score += min(3, len(frame_lines))
+    if diagnostic_signal:
+        score += 1
+    if len(frame_lines) >= 2 and len(field_lines) >= 2:
+        score += 1
+    if timestamped_lines >= 2:
+        score -= 3
+
+    if score >= 6 and len(frame_lines) >= 2 and (len(field_lines) >= 2 or header_signal):
+        return "EXCEPTION_DOCUMENT"
+
+    if timestamped_lines >= 2:
+        return "TIMESTAMPED_LOG"
+
+    return "PLAINTEXT"
+
+
+def detect_input_structure(content: str, source_filename: str = "") -> tuple[str, dict[str, Any]]:
+    lines = [line.strip() for line in content.strip().splitlines() if line.strip()]
+    if not lines:
+        return "plain_text", {"confidence": 0.0, "reason": "empty"}
+
+    key_confidence, key_stats = _score_key_value_lines(lines)
+    command_confidence, command_stats = _score_command_status_lines(lines)
+
+    if key_confidence >= 0.6 and key_confidence >= command_confidence + 0.1:
+        return "key_value", {
+            "confidence": key_confidence,
+            "matched_line_ratio": key_stats["meaningful_lines"] / max(1, len(lines)),
+            "meaningful_lines": key_stats["meaningful_lines"],
+            "assignment_count": key_stats["assignment_count"],
+            "meaningful_fields": key_stats["meaningful_fields"],
+        }
+
+    if command_confidence >= 0.6 and command_confidence >= key_confidence + 0.1:
+        return "command_status", {
+            "confidence": command_confidence,
+            "matched_line_ratio": (command_stats["assignment_lines"] + command_stats["summary_lines"]) / max(1, len(lines)),
+            "meaningful_lines": command_stats["assignment_lines"] + command_stats["summary_lines"],
+            "prompt_lines": command_stats["prompt_lines"],
+            "state_lines": command_stats["state_lines"],
+            "metric_lines": command_stats["metric_lines"],
+        }
+
+    return "plain_text", {"confidence": max(key_confidence, command_confidence), "reason": "generic"}
+
+
+def _parse_exception_document(content: str, source_filename: str = "") -> Optional[list[dict]]:
+    lines = [line.rstrip() for line in content.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    if detect_document_type(content, source_filename) != "EXCEPTION_DOCUMENT":
+        return None
+
+    stack_lines: list[str] = []
+    header_line = None
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^\s*(at|caused by)\b", stripped, re.IGNORECASE) or re.search(r"[A-Za-z0-9_.$]+\.java:\d+", stripped):
+            stack_lines.append(stripped)
+            continue
+        if header_line is None:
+            header_line = stripped
+
+    if not header_line:
+        return None
+
+    message = header_line
+    for line in lines:
+        stripped = line.strip()
+        if re.search(r"http\s+4\d\d|http\s+5\d\d|unauthorized|forbidden|access denied", stripped, re.IGNORECASE):
+            message = stripped
+            break
+
+    diagnostic_blocks = []
+    if stack_lines:
+        diagnostic_blocks.append({
+            "kind": "DIAGNOSTIC_BLOCK",
+            "message": f"Stack trace — {len(stack_lines)} frames",
+            "raw_lines": stack_lines,
+        })
+
+    return [
+        _build_structural_event(
+            source_filename=source_filename,
+            file_correlation_id=f"structured-{extract_component_from_filename(source_filename)}",
+            message=message,
+            level="ERROR",
+            structured_fields={
+                "document_type": "EXCEPTION_DOCUMENT",
+                "record_type": "EXCEPTION",
+                "diagnostic_blocks": diagnostic_blocks,
+                "timestamp_source": "missing",
+            },
+            timestamp=None,
+            raw_line="\n".join(lines),
+            error_code="HTTP_4XX" if re.search(r"http\s+4\d\d", message, re.IGNORECASE) else "HTTP_5XX" if re.search(r"http\s+5\d\d", message, re.IGNORECASE) else None,
+            sequence=0,
+        )
+    ]
+
+
+def _build_command_status_event(
+    *,
+    lines: list[str],
+    source_filename: str,
+    fields: dict[str, Any],
+    default_message: str,
+    extra_structured_fields: Optional[dict[str, Any]] = None,
+) -> list[dict]:
+    state = str(fields.get("state", "")).strip().lower()
+    level = "ERROR" if state in {"down", "error", "failed", "degraded", "critical"} else "WARN" if state in {"warning", "warn"} else "INFO"
+    message = str(fields.get("summary") or fields.get("message") or "").strip()
+    if not message and fields.get("section") and fields.get("state"):
+        message = f"{fields['section']} status: {fields['state']}"
+    elif not message:
+        message = default_message
+
+    structured_fields = dict(fields)
+    if extra_structured_fields:
+        structured_fields.update(extra_structured_fields)
+
+    return [
+        _build_structural_event(
+            source_filename=source_filename,
+            file_correlation_id=f"structured-{extract_component_from_filename(source_filename)}",
+            message=message,
+            level=level,
+            structured_fields=structured_fields,
+            timestamp=None,
+            raw_line=" | ".join(lines),
+            error_code=None,
+            sequence=0,
+        )
+    ]
+
+
+def _parse_command_status_document(content: str, source_filename: str = "") -> Optional[list[dict]]:
+    lines = [line.strip() for line in content.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    if detect_document_type(content, source_filename) != "COMMAND_STATUS":
+        return None
+
+    fields: dict[str, Any] = {}
+    for line in lines:
+        if line.startswith("$") or line.startswith("#"):
+            continue
+        if re.match(r"^[A-Za-z0-9_.-]+=", line):
+            key, _, value = line.partition("=")
+            fields[key.strip()] = _coerce_structured_value(value.strip())
+
+    if not fields:
+        return None
+
+    return _build_command_status_event(
+        lines=lines,
+        source_filename=source_filename,
+        fields=fields,
+        default_message="status snapshot",
+        extra_structured_fields={
+            "document_type": "COMMAND_STATUS",
+            "record_type": "OPERATIONAL_EVENT",
+            "timestamp_source": "missing",
+        },
+    )
+
+
+def _build_tabular_events(
+    *,
+    lines: list[str],
+    source_filename: str,
+    recognized: dict[str, int],
+    base_structured_fields: Optional[dict[str, Any]] = None,
+) -> Optional[list[dict]]:
+    records: list[dict] = []
+    file_correlation_id = f"structured-{extract_component_from_filename(source_filename)}"
+
+    for index, line in enumerate(lines[1:], start=1):
+        if line.startswith("$") or line.startswith("#"):
+            continue
+        tokens = line.split()
+        if not tokens or len(tokens) < 3:
+            continue
+        if all(token.lower() in {"first_seen", "last_seen", "count", "source", "reason", "message"} for token in tokens):
             continue
 
-        prev_known = max((idx for idx in known_indices if idx < i), default=None)
-        next_known = min((idx for idx in known_indices if idx > i), default=None)
+        values: dict[str, str] = {}
+        for key, idx in recognized.items():
+            if key in {"message", "details"}:
+                values[key] = " ".join(tokens[idx:]).strip() if idx < len(tokens) else ""
+            elif idx < len(tokens):
+                values[key] = tokens[idx]
 
-        if prev_known is not None and next_known is not None:
-            prev_ts = records[prev_known]["timestamp"]
-            next_ts = records[next_known]["timestamp"]
-            missing_between = [idx for idx in range(prev_known + 1, next_known) if not isinstance(records[idx].get("timestamp"), datetime)]
-            if missing_between:
-                position = missing_between.index(i) + 1
-                step = (next_ts - prev_ts) / (len(missing_between) + 1)
-                record["timestamp"] = prev_ts + (step * position)
-            else:
-                record["timestamp"] = prev_ts + (next_ts - prev_ts) / 2
-        elif prev_known is not None:
-            prev_ts = records[prev_known]["timestamp"]
-            offset = sum(1 for idx in range(prev_known + 1, i) if not isinstance(records[idx].get("timestamp"), datetime))
-            record["timestamp"] = prev_ts + timedelta(seconds=offset + 1)
-        elif next_known is not None:
-            next_ts = records[next_known]["timestamp"]
-            offset = sum(1 for idx in range(i + 1, next_known) if not isinstance(records[idx].get("timestamp"), datetime))
-            record["timestamp"] = next_ts - timedelta(seconds=offset + 1)
-        else:
-            base = default_start or datetime.now(timezone.utc).replace(microsecond=0)
-            record["timestamp"] = base + timedelta(seconds=i)
+        if not values:
+            continue
 
-    for record in records:
-        if isinstance(record.get("timestamp"), datetime):
-            record["timestamp"] = record["timestamp"].isoformat()
+        first_seen = values.get("first_seen") or values.get("time") or values.get("timestamp")
+        last_seen = values.get("last_seen")
+        count_value = values.get("count")
+        source_value = values.get("source") or values.get("from")
+        reason_value = values.get("reason")
+        message_value = values.get("message") or values.get("details") or ""
+
+        timestamp = _parse_iso_timestamp(first_seen) if first_seen else None
+        if timestamp is None and last_seen:
+            timestamp = _parse_iso_timestamp(last_seen)
+
+        structured_fields: dict[str, Any] = dict(base_structured_fields or {})
+        if count_value is not None:
+            try:
+                structured_fields["count"] = int(count_value)
+            except ValueError:
+                structured_fields["count"] = count_value
+        if source_value:
+            structured_fields["source"] = source_value
+        if reason_value:
+            structured_fields["reason"] = reason_value
+        if message_value:
+            structured_fields["message"] = message_value
+        if first_seen:
+            structured_fields["first_seen"] = first_seen
+        if last_seen:
+            structured_fields["last_seen"] = last_seen
+        if "timestamp_source" in structured_fields:
+            structured_fields["timestamp_source"] = "parsed" if timestamp is not None else "missing"
+
+        level = "ERROR" if any(token in (message_value + " " + (reason_value or "")).lower() for token in ("error", "failed", "failure", "fatal", "timeout", "cancelled", "denied")) else "INFO"
+        records.append(
+            _build_structural_event(
+                source_filename=source_filename,
+                file_correlation_id=file_correlation_id,
+                message=message_value or reason_value or "structured table event",
+                level=level,
+                structured_fields=structured_fields,
+                timestamp=timestamp,
+                raw_line=line,
+                error_code="STRUCTURED_EVENT" if level == "ERROR" else None,
+                sequence=index,
+            )
+        )
+
+    return records or None
+
+
+def _parse_tabular_report_document(content: str, source_filename: str = "") -> Optional[list[dict]]:
+    lines = [line.strip() for line in content.strip().splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+
+    if detect_document_type(content, source_filename) != "TABULAR_REPORT":
+        return None
+
+    header_line = lines[0]
+    header_tokens = [token for token in re.split(r"\s{2,}|\s+", header_line) if token]
+    normalized_header = [token.lower() for token in header_tokens]
+    recognized = {name: idx for idx, name in enumerate(normalized_header) if name in {"first_seen", "last_seen", "count", "source", "from", "reason", "message", "details"}}
+    if not recognized:
+        return None
+
+    return _build_tabular_events(
+        lines=lines,
+        source_filename=source_filename,
+        recognized=recognized,
+        base_structured_fields={
+            "document_type": "TABULAR_REPORT",
+            "record_type": "OPERATIONAL_EVENT",
+            "timestamp_source": "missing",
+        },
+    )
+
+
+def _parse_key_value_block(content: str, source_filename: str = "") -> Optional[list[dict]]:
+    lines = [line.strip() for line in content.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    parser_name, metadata = detect_input_structure(content, source_filename)
+    if parser_name != "key_value":
+        return None
+    if metadata.get("confidence", 0.0) < 0.6:
+        return None
+    if metadata.get("matched_line_ratio", 0.0) < 0.25:
+        return None
+
+    assignment_count = 0
+    for line in lines:
+        if line.startswith("$"):
+            continue
+        assignment_count += len(re.findall(r"([A-Za-z0-9_.-]+)\s*=", line))
+
+    if assignment_count < 2:
+        return None
+
+    file_correlation_id = f"structured-{extract_component_from_filename(source_filename)}"
+    records: list[dict] = []
+    for line in lines:
+        if not line or line.startswith("$"):
+            continue
+        field_matches = list(re.finditer(r"([A-Za-z0-9_.-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s]+))", line))
+        if not field_matches:
+            continue
+
+        fields: dict[str, Any] = {}
+        for match in field_matches:
+            key = match.group(1)
+            value = match.group(2) if match.group(2) is not None else match.group(3) if match.group(3) is not None else match.group(4) or ""
+            fields[key] = _coerce_structured_value(value)
+
+        timestamp = None
+        for key in ("time", "timestamp", "ts"):
+            value = fields.get(key)
+            if isinstance(value, str):
+                timestamp = _parse_iso_timestamp(value)
+                if timestamp is not None:
+                    break
+
+        level = _extract_generic_level(fields, fallback="INFO")
+        message = ""
+        for key in ("msg", "message", "summary", "cause"):
+            if isinstance(fields.get(key), str) and fields[key].strip():
+                message = fields[key]
+                break
+        if not message and fields.get("cause"):
+            message = str(fields["cause"])
+
+        records.append(
+            _build_structural_event(
+                source_filename=source_filename,
+                file_correlation_id=file_correlation_id,
+                message=message or "structured event",
+                level=level,
+                structured_fields=fields,
+                timestamp=timestamp,
+                raw_line=line,
+                error_code="STRUCTURED_EVENT" if level == "ERROR" else None,
+                sequence=len(records),
+            )
+        )
+
+    return records or None
+
+
+def _parse_tabular_events(content: str, source_filename: str = "") -> Optional[list[dict]]:
+    lines = [line.strip() for line in content.strip().splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+
+    header_line = lines[0]
+    header_tokens = [token for token in re.split(r"\s{2,}|\s+", header_line) if token]
+    if not header_tokens:
+        return None
+
+    normalized_header = [token.lower() for token in header_tokens]
+    recognized = {name: idx for idx, name in enumerate(normalized_header) if name in {"first_seen", "last_seen", "count", "source", "from", "reason", "message", "details"}}
+    if not recognized:
+        return None
+
+    return _build_tabular_events(
+        lines=lines,
+        source_filename=source_filename,
+        recognized=recognized,
+    )
+
+
+def _parse_command_status_block(content: str, source_filename: str = "") -> Optional[list[dict]]:
+    lines = [line.strip() for line in content.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    parser_name, metadata = detect_input_structure(content, source_filename)
+    if parser_name != "command_status":
+        return None
+    if metadata.get("confidence", 0.0) < 0.6:
+        return None
+
+    if not any(line.startswith("$") for line in lines) and not any(re.match(r"^[A-Za-z0-9_.-]+=", line) for line in lines):
+        return None
+
+    fields: dict[str, Any] = {}
+    for line in lines:
+        if line.startswith("$") or line.startswith("#"):
+            continue
+        if re.match(r"^[A-Za-z0-9_.-]+=", line):
+            key, _, value = line.partition("=")
+            fields[key.strip()] = _coerce_structured_value(value.strip())
+
+    if not fields:
+        return None
+
+    return _build_command_status_event(
+        lines=lines,
+        source_filename=source_filename,
+        fields=fields,
+        default_message="status block",
+    )
+
+
+def try_parse_document_structures(content: str, source_filename: str = "") -> tuple[Optional[list[dict]], str]:
+    for parser in (
+        _parse_exception_document,
+        _parse_command_status_document,
+        _parse_tabular_report_document,
+    ):
+        records = parser(content, source_filename)
+        if records:
+            return records, ""
+    return None, ""
+
+
+def try_parse_structural_formats(content: str, source_filename: str = "") -> tuple[Optional[list[dict]], str]:
+    for parser in (
+        _parse_key_value_block,
+        _parse_tabular_events,
+        _parse_command_status_block,
+    ):
+        records = parser(content, source_filename)
+        if records:
+            return records, ""
+    return None, ""
+
+
+def _validate_log_entries(logs_data: list[dict]) -> list[LogEntry]:
+    _interpolate_missing_timestamps(logs_data)
+    return [LogEntry.model_validate(log) for log in logs_data]
 
 
 def normalize_json_to_log_entry(
@@ -373,6 +1006,7 @@ def try_parse_jsonlines(content: str, source_filename: str = "") -> tuple[Option
     records: list[dict] = []
     known_timestamps: list[datetime] = []
     file_correlation_id = None
+    saw_json_object = False
 
     for raw_line in lines:
         line = raw_line.strip()
@@ -410,6 +1044,7 @@ def try_parse_jsonlines(content: str, source_filename: str = "") -> tuple[Option
                 )
             continue
 
+        saw_json_object = True
         if isinstance(obj, dict):
             correlation_id = _extract_correlation_id_from_json_obj(obj)
             if correlation_id and file_correlation_id is None:
@@ -453,6 +1088,9 @@ def try_parse_jsonlines(content: str, source_filename: str = "") -> tuple[Option
                 parse_status="json_scalar_unparsed",
             )
         )
+
+    if not saw_json_object:
+        return None, "Not JSON-lines."
 
     if not records:
         return None, "No valid JSON lines found."
@@ -516,6 +1154,12 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
 
     # Multiple regex patterns to try for each line
     patterns = [
+        # Generic component: message lines (e.g. "monitoring: snapshot failed")
+        r"^(?P<component>[A-Za-z][A-Za-z0-9_.-]*):\s*(?P<message>.+)$",
+        # Shell prompt and command output block lines like "[ceph@mon1 ~]$ ceph -s"
+        r"^\[(?P<component>[A-Za-z0-9_.@-]+)\s+~\]\$\s*(?P<message>.+)$",
+        # Timestamp + component + level + message (e.g. "2026-07-29T15:23:07.000Z monitoring ERROR snapshot failed")
+        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<component>[A-Za-z0-9_.-]+)\s+(?P<level>INFO|WARN|ERROR|WARNING|DEBUG)\s+(?P<message>.+)$",
         # ISO 8601 timestamp + space-separated fields
         r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[Z+-].{0,6}?)\s+(?P<component>\w+)\s+(?P<component_id>\w+)\s+(?P<level>INFO|WARN|ERROR|WARNING|DEBUG)\s+(?P<message>.+)$",
         # ISO timestamp with [LEVEL] component: message
@@ -550,7 +1194,7 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
                     else:
                         # Try space-separated format
                         timestamp = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                        # Assume UTC if not specified
+                        # Try to assume UTC if not specified
                         timestamp = timestamp.replace(tzinfo=timezone.utc)
                 except (ValueError, AttributeError):
                     # If parsing fails, use last timestamp or current time
@@ -558,7 +1202,9 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
 
                 # Update tracking variables for orphaned lines
                 last_timestamp = timestamp
-                last_component = data.get("component", last_component)
+                raw_component = data.get("component", last_component)
+                normalized_component = str(raw_component).replace("_", "-").strip()
+                last_component = normalized_component or last_component
                 last_level = data.get("level", "INFO").upper()
 
                 # Extract message (for logging/display purposes, not for correlation ID)
@@ -568,15 +1214,23 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
                 if last_level == "INFO" and re.search(r"\b(fatal|error|failed|failed|corruption|cannot|unable)\b", message_text, re.IGNORECASE):
                     last_level = "ERROR"
 
+                if not last_level or last_level == "INFO":
+                    lowered_message = message_text.lower()
+                    if any(token in lowered_message for token in ("health_err", "error", "failed", "fatal", "denied", "timeout", "cancelled", "critical", "stuck", "degraded", "inactive", "stale", "unclean", "undersized")):
+                        last_level = "ERROR"
+                    elif any(token in lowered_message for token in ("warn", "warning", "degraded")):
+                        last_level = "WARN"
+
                 log_entry = {
                     "timestamp": timestamp.isoformat(),
                     "correlationId": file_correlation_id,  # Use consistent ID for all events in file
-                    "componentId": data.get("component_id", last_component).lower(),
+                    "componentId": str(data.get("component_id") or last_component).lower(),
                     "component": last_component,
                     "level": last_level,
                     "errorCode": "PLAINTEXT" if last_level == "ERROR" else None,
                     "message": message_text,
                     "traceId": None,
+                    "structuredFields": {"timestamp_source": "parsed"},
                 }
                 logs.append(log_entry)
                 matched = True
@@ -586,8 +1240,11 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
             # Orphaned line: associate with last timestamp
             # Check if the line contains error keywords
             orphaned_level = last_level
-            if orphaned_level == "INFO" and re.search(r"\b(fatal|error|failed|corruption|cannot|unable)\b", line, re.IGNORECASE):
+            lowered_line = line.lower()
+            if orphaned_level == "INFO" and re.search(r"\b(fatal|error|failed|corruption|cannot|unable|health_err|stuck|degraded|inactive|stale|unclean|undersized)\b", line, re.IGNORECASE):
                 orphaned_level = "ERROR"
+            elif orphaned_level == "INFO" and re.search(r"\b(warn|warning|degraded)\b", line, re.IGNORECASE):
+                orphaned_level = "WARN"
             
             log_entry = {
                 "timestamp": last_timestamp.isoformat(),
@@ -598,6 +1255,7 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
                 "errorCode": "PLAINTEXT" if orphaned_level == "ERROR" else None,
                 "message": line,
                 "traceId": None,
+                "structuredFields": {"timestamp_source": "inherited"},
             }
             logs.append(log_entry)
             last_level = orphaned_level
@@ -628,6 +1286,9 @@ def parse_uploaded_logs(content: str, source_filename: str = "") -> tuple[Option
         return None, "File is empty or contains only whitespace."
 
     content_start = content.strip()[:1]
+    looks_like_plaintext = bool(
+        re.search(r"^\s*(?:\d{4}-\d{2}-\d{2}T|\[)", content, re.MULTILINE)
+    )
 
     # Strategy 1a: Quick check for JSON-lines (multiline JSON objects)
     # If content has multiple lines and doesn't start with [ or {, try JSON-lines first
@@ -636,11 +1297,18 @@ def parse_uploaded_logs(content: str, source_filename: str = "") -> tuple[Option
         if logs_data:
             # Try direct LogEntry validation first
             try:
-                parsed_logs = [LogEntry.model_validate(log) for log in logs_data]
+                parsed_logs = _validate_log_entries(logs_data)
                 if parsed_logs:
                     return parsed_logs, ""
             except Exception:
                 pass  # JSON-lines objects don't match LogEntry schema, try normalizing
+
+    if not (content.strip().startswith("{") or content.strip().startswith("[")):
+        json_error = None
+        logs_data = None
+    else:
+        json_error = None
+        logs_data = None
 
     # Strategy 1b: Try JSON array or Scenario format
     # BUT: Skip this if content looks like multiline JSON-lines (multiple lines each starting with { or [)
@@ -677,14 +1345,14 @@ def parse_uploaded_logs(content: str, source_filename: str = "") -> tuple[Option
         try:
             if not logs_data:
                 return None, "File contains no log entries."
-            parsed_logs = [LogEntry.model_validate(log) for log in logs_data]
+            parsed_logs = _validate_log_entries(logs_data)
             if parsed_logs:
                 return parsed_logs, ""
         except Exception as e:
             json_error = f"JSON validation failed: {str(e)[:80]}"
 
-    # If JSON had obvious syntax errors (starts with { or [), reject plaintext fallback
-    if content_start in "{[" and not is_likely_jsonlines:
+    # If the content clearly looks like JSON but failed to parse, reject plaintext fallback.
+    if (content_start in "{[" or content.strip().startswith("{") or content.strip().startswith("[")) and not is_likely_jsonlines:
         # Looks like JSON but failed to parse — don't try plaintext
         return (
             None,
@@ -692,11 +1360,37 @@ def parse_uploaded_logs(content: str, source_filename: str = "") -> tuple[Option
             "Provide a JSON array or {logs: [...]} object.",
         )
 
-    # Strategy 2: Try plaintext parsing (only if content doesn't look like JSON)
+    # Strategy 2: Try logical document parsers before generic structural/line fallback.
+    logs_data, _ = try_parse_document_structures(content, source_filename)
+    if logs_data:
+        try:
+            parsed_logs = _validate_log_entries(logs_data)
+            if parsed_logs:
+                return parsed_logs, ""
+        except Exception as e:
+            return (
+                None,
+                f"Document parsing extracted entries but validation failed: {str(e)[:80]}",
+            )
+
+    # Strategy 3: Try structural parsers before generic plaintext fallback.
+    logs_data, _ = try_parse_structural_formats(content, source_filename)
+    if logs_data:
+        try:
+            parsed_logs = _validate_log_entries(logs_data)
+            if parsed_logs:
+                return parsed_logs, ""
+        except Exception as e:
+            return (
+                None,
+                f"Structural parsing extracted entries but validation failed: {str(e)[:80]}",
+            )
+
+    # Strategy 4: Try plaintext parsing (only if content doesn't look like JSON, document structures, or structural formats)
     logs_data, plaintext_error = try_parse_plaintext(content, source_filename)
     if logs_data:
         try:
-            parsed_logs = [LogEntry.model_validate(log) for log in logs_data]
+            parsed_logs = _validate_log_entries(logs_data)
             if parsed_logs:
                 # Success with plaintext parsing
                 return parsed_logs, ""

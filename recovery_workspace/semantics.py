@@ -45,6 +45,7 @@ NONTERMINAL_SEMANTIC_CODES = {
     "LOCK_OR_CONCURRENCY_FAILURE",
     "OPERATION_ABORTED_OR_CANCELLED",
     "RESOURCE_ACCESS_FAILURE",
+    "SYSTEM_HEALTH_DEGRADATION",
     "UNKNOWN_OPERATIONAL_ERROR",
 }
 
@@ -57,7 +58,7 @@ SEMANTIC_SUPPORTING_FIELDS = (
     "failure_reason",
 )
 
-SEMANTIC_PLACEHOLDER_CODES = {"PLAINTEXT_FATAL", "RAW_UNPARSED", "NO_CODE", "UNKNOWN_CODE", "JSON", "STRUCTURED_EVENT"}
+SEMANTIC_PLACEHOLDER_CODES = {"PLAINTEXT", "PLAINTEXT_FATAL", "RAW_UNPARSED", "NO_CODE", "UNKNOWN_CODE", "JSON", "STRUCTURED_EVENT"}
 
 
 def _component_key(component: str) -> str:
@@ -236,6 +237,31 @@ def _mode_from_text(text: str) -> Optional[str]:
 def _generic_semantic_family(entry: Any) -> Optional[str]:
     haystack = _canonical_semantic_text(entry).lower()
 
+    degradation_tokens = (
+        "degraded",
+        "inactive",
+        "stale",
+        "undersized",
+        "unclean",
+        "down",
+        "unavailable",
+    )
+    health_tokens = (
+        "health_err",
+        "health_warn",
+        "critical health",
+        "health status",
+        "status error",
+        "status critical",
+    )
+
+    if any(token in haystack for token in health_tokens):
+        return "SYSTEM_HEALTH_DEGRADATION"
+    if any(token in haystack for token in degradation_tokens) and any(
+        token in haystack for token in ("health", "status")
+    ):
+        return "SYSTEM_HEALTH_DEGRADATION"
+
     if any(term in haystack for term in ("access conflict", "resource conflict", "resource busy", "contention", "in use", "busy", "conflict")):
         return "ACCESS_OR_RESOURCE_CONFLICT"
     if any(term in haystack for term in ("lock", "locked", "concurrency", "race", "contention")):
@@ -321,6 +347,8 @@ def _infer_event_type(entry: Any, semantic_error_code: Optional[str] = None) -> 
         return "OPERATION_ABORTED_OR_CANCELLED"
     if semantic_error_code in {"RESOURCE_ACCESS_FAILURE"}:
         return "RESOURCE_ACCESS_FAILURE"
+    if semantic_error_code in {"SYSTEM_HEALTH_DEGRADATION"}:
+        return "SYSTEM_HEALTH_DEGRADATION"
     if semantic_error_code in {"UNKNOWN_OPERATIONAL_ERROR"}:
         return "OPERATIONAL_ERROR"
     if semantic_error_code in {"UNKNOWN_TERMINAL_FAILURE", "EXIT_FAILURE", "FAILURE", "FAILED", "JOB_FAILED", "RETRY_EXHAUSTED", "PERMISSION_DENIED", "PARTIAL_SUCCESS", "QUOTA_EXCEEDED", "ACCESS_DENIED", "CORRUPTION_DETECTED", "ETIMEDOUT", "ECONNRESET", "ENETUNREACH", "SERVICE_UNAVAILABLE", "REQUEST_TIME_TOO_SKEWED"}:
@@ -430,6 +458,8 @@ def _infer_cause_type(entry: Any, semantic_error_code: Optional[str] = None) -> 
             return "LOCK_OR_CONCURRENCY"
         if semantic_error_code in {"RESOURCE_ACCESS_FAILURE"}:
             return "RESOURCE_ACCESS"
+        if semantic_error_code in {"SYSTEM_HEALTH_DEGRADATION"}:
+            return "SYSTEM_DEGRADATION"
         if semantic_error_code in {"UNKNOWN_OPERATIONAL_ERROR", "UNKNOWN_TERMINAL_FAILURE", "OPERATION_ABORTED_OR_CANCELLED"}:
             return None
         if semantic_error_code in {"ACCESS_DENIED", "PERMISSION_DENIED", "UNAUTHORIZED"}:

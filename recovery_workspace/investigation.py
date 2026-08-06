@@ -72,9 +72,11 @@ def _format_event_context(event: Event) -> EventContext:
 
 
 def _format_timeline_entry_context(entry: Any) -> TimelineEntryContext:
+    timestamp_source = _timeline_entry_timestamp_source(entry)
+    timestamp_text = entry.event.timestamp.isoformat() if timestamp_source in {"available", "parsed"} else None
     return TimelineEntryContext(
         sequence=entry.sequence,
-        timestamp=entry.event.timestamp.isoformat(),
+        timestamp=timestamp_text,
         component=entry.event.component,
         level=entry.event.level,
         error_code=entry.event.error_code,
@@ -286,6 +288,23 @@ FAILURE_RULES = [
         {"backup_service", "network", "storage"},
     ),
     (
+        "system_health_degradation",
+        {"SYSTEM_HEALTH_DEGRADATION"},
+        (
+            "health_err",
+            "health_warn",
+            "critical health",
+            "degraded",
+            "inactive",
+            "stale",
+            "undersized",
+            "unclean",
+            "down",
+            "unavailable",
+        ),
+        None,
+    ),
+    (
         "resource_access_failure",
         {"RESOURCE_ACCESS_FAILURE"},
         ("bad file descriptor", "stale file handle", "input/output error", "i/o error", "too many open files", "read-only file system"),
@@ -305,6 +324,7 @@ EXACT_SIGNAL_WEIGHTS = {
     "REQUEST_TIME_TOO_SKEWED": 0.3,
     "CLOCK_SKEW_DETECTED": 0.3,
     "PARTIAL_SUCCESS": 0.18,
+    "SYSTEM_HEALTH_DEGRADATION": 0.22,
 }
 
 
@@ -566,6 +586,12 @@ def build_evidence_display(entry: TimelineEntryContext, role: str) -> tuple[str,
             )
         return summary, detail
 
+    if semantic_code == "SYSTEM_HEALTH_DEGRADATION":
+        return (
+            "Critical system health degradation detected.",
+            "The supplied status snapshot shows degraded/inactive resources and unavailable services.",
+        )
+
     semantic_bits: list[str] = []
     for value in (
         getattr(entry, "cause_type", None),
@@ -650,6 +676,7 @@ def _semantic_causal_strength(entry: TimelineEntryContext) -> int:
         "STORAGE_CAPACITY",
         "RESOURCE_EXHAUSTION",
         "RESOURCE_ACCESS",
+        "SYSTEM_DEGRADATION",
         "AUTHENTICATION",
         "AUTHORIZATION",
         "REPOSITORY_CORRUPTION",
@@ -666,6 +693,7 @@ def _semantic_causal_strength(entry: TimelineEntryContext) -> int:
         "LOCK_OR_CONCURRENCY_FAILURE",
         "TERMINAL_FAILURE",
         "PARTIAL_FAILURE",
+        "SYSTEM_HEALTH_DEGRADATION",
     }:
         score += 3
 
@@ -673,6 +701,7 @@ def _semantic_causal_strength(entry: TimelineEntryContext) -> int:
         "LOCK_OR_CONCURRENCY_FAILURE",
         "RESOURCE_ACCESS_FAILURE",
         "RESOURCE_EXHAUSTION",
+        "SYSTEM_HEALTH_DEGRADATION",
         "QUOTA_EXCEEDED",
         "ACCESS_DENIED",
         "PERMISSION_DENIED",
@@ -930,6 +959,8 @@ def _inferred_failure_mode(
         return "clock_skew"
     if canonical in {"PARTIAL_SUCCESS"}:
         return "partial_failure"
+    if canonical in {"SYSTEM_HEALTH_DEGRADATION"}:
+        return "system_health_degradation"
     if canonical in {"RESOURCE_ACCESS_FAILURE"}:
         return "resource_access_failure"
     if _has_failure_prefix(entry) or _structured_message_type(entry) in {"error", "exit_error"} or entry.level in {"WARN", "ERROR"}:
@@ -1053,7 +1084,7 @@ def _classify_failure_mode(
 
         score = len(matches)
         causal = _latest_causal_event(matches, terminal_sequence)
-        if causal is not None and causal.error_code in codes:
+        if causal is not None and _canonical_error_code(causal) in codes:
             score += 3
         if any(entry.level == "WARN" for entry in matches):
             score += 1
@@ -1120,6 +1151,12 @@ def _evidence_grounded_actions(
             "Isolate failed child tasks and re-run only the failed volumes instead of the entire job.",
             "Track per-task success/failure metrics so partial outcomes trigger explicit remediation workflows.",
             "Review whether child task failures are related to resource contention or environmental issues.",
+        ],
+        "system_health_degradation": [
+            "Inspect unavailable daemon, service, and resource status logs around the captured snapshot window.",
+            "Verify host and device health for resources reported degraded, inactive, stale, or down.",
+            "Review recovery, rebalance, or remapping state for resources stuck in degraded or inactive states.",
+            "Collect deeper service and operating-system evidence to identify the underlying infrastructure cause.",
         ],
         "resource_access_failure": [
             "Inspect service, operating-system, and I/O logs around the failure timestamp.",
@@ -1221,6 +1258,8 @@ def _root_cause_text(mode: str, causal_event: Optional[TimelineEntryContext]) ->
         return "Observed clock skew caused signed requests to be rejected."
     if mode == "partial_failure":
         return "Observed partial failure after one or more child tasks failed."
+    if mode == "system_health_degradation":
+        return "The supplied status snapshot shows degraded/inactive resources and unavailable services."
     if mode == "resource_access_failure":
         observed_cause = (getattr(causal_event, "observed_cause", None) or "").strip() if causal_event is not None else ""
         if causal_event is not None and "object info" in causal_event.message.lower():
@@ -1248,6 +1287,8 @@ def _root_cause_text(mode: str, causal_event: Optional[TimelineEntryContext]) ->
                 return f"The service could not read object metadata because the underlying system returned {observed_cause}."
             if observed_cause:
                 return f"The service could not access a required resource because the underlying system returned {observed_cause}."
+        if semantic_code == "SYSTEM_HEALTH_DEGRADATION" or cause_type == "SYSTEM_DEGRADATION":
+            return "The supplied status snapshot shows degraded/inactive resources and unavailable services."
     if mode == "generic_fatal":
         if causal_event is not None:
             concise_message = _concise_observed_message(causal_event.message)
@@ -1277,13 +1318,51 @@ def _supports_corroboration(entry: TimelineEntryContext) -> bool:
    return False
 
 
+def _corroboration_identity_key(entry: TimelineEntryContext) -> tuple[str, str]:
+    non_identity_tokens = {
+        "error",
+        "fatal",
+        "warn",
+        "warning",
+        "info",
+        "debug",
+        "trace",
+        "unknown",
+        "plaintext",
+        "raw",
+        "parser",
+        "generic",
+    }
+
+    component = _component_key(entry.component)
+    if component and component not in non_identity_tokens:
+        return ("component", component)
+
+    source_file = _evidence_source_file(entry)
+    if source_file:
+        return ("source", source_file.lower().strip())
+
+    return ("unknown", "unknown")
+
+
 def _temporal_chain_strength(
    matched_entries: list[TimelineEntryContext],
    terminal_entries: list[TimelineEntryContext],
 ) -> tuple[float, list[str]]:
    explanation: list[str] = []
+   timestamp_sources = {(_evidence_timestamp_source(entry) or "").lower().strip() for entry in matched_entries + terminal_entries}
+   observed_timestamps_available = bool(timestamp_sources.intersection({"available", "parsed"}))
    warnings = [entry for entry in matched_entries if entry.level == "WARN"]
    errors = [entry for entry in matched_entries if entry.level == "ERROR" and not _is_terminal_outcome_event(entry)]
+   if not observed_timestamps_available:
+       explanation.append("Event sequence is preserved from document order, but observed timestamps are unavailable, so temporal causality cannot be verified.")
+       if warnings and errors and terminal_entries:
+           return 0.2, explanation
+       if errors and terminal_entries and errors[-1].sequence < terminal_entries[-1].sequence:
+           return 0.14, explanation
+       if errors:
+           return 0.07, explanation
+       return 0.02, explanation
    if warnings and errors and terminal_entries:
        if warnings[0].sequence < errors[-1].sequence < terminal_entries[-1].sequence:
            explanation.append("✓ Clear temporal chain: warning → causal error → terminal outcome")
@@ -1335,7 +1414,7 @@ def _compute_confidence(
        explanation.append("• Only terminal outcome evidence is available")
 
    corroborating_entries = [entry for entry in matched_entries if _supports_corroboration(entry)]
-   unique_components = {_component_key(entry.component) for entry in corroborating_entries}
+   unique_components = {_corroboration_identity_key(entry) for entry in corroborating_entries}
    corroborating_components = min(len(unique_components), 3)
    if corroborating_components >= 3:
        breakdown["corroboration"] = 0.22
@@ -1493,6 +1572,8 @@ def select_investigation_evidence(context: InvestigationContext) -> Investigatio
            limitations.append("The evidence does not establish whether the failure was authentication, authorization policy, token expiry, gateway enforcement, or another identity issue.")
        if primary_code == "RESOURCE_ACCESS_FAILURE":
            limitations.append("The supplied evidence does not establish whether the underlying problem was filesystem state, device failure, process descriptor state, or an operating-system issue.")
+       if primary_code == "SYSTEM_HEALTH_DEGRADATION":
+           limitations.append("The snapshot does not identify which host, device, daemon, or network failure caused the degradation.")
 
    competing_scores = sorted(
        (score for family, score in rule_scores.items() if family != mode and score > 0),
@@ -1644,6 +1725,9 @@ def _primary_causal_label(evidence: InvestigationEvidence) -> str:
             return "Object metadata access failure"
         return "Resource access failure"
 
+    if (primary.semantic_error_code or "").upper() == "SYSTEM_HEALTH_DEGRADATION":
+        return "Critical system health degradation"
+
     semantic_bits: list[str] = []
     for value in (primary.cause_type, primary.event_type, primary.semantic_error_code, primary.error_code):
         if isinstance(value, str) and value.strip():
@@ -1669,6 +1753,9 @@ def _observed_failure_text(evidence: InvestigationEvidence) -> str:
         if "object info" in primary.message.lower():
             return "Object metadata access failed."
         return "Resource access failed."
+
+    if (primary.semantic_error_code or "").upper() == "SYSTEM_HEALTH_DEGRADATION":
+        return "Critical system health degradation detected."
 
     if primary.display_summary:
         return _generic_sentence(primary.display_summary)
@@ -1770,10 +1857,24 @@ def _confidence_dimension_rationale(key: str, value: float, evidence: Investigat
             return "Primary causal event was selected from non-terminal evidence."
         return "No non-terminal primary causal event was isolated."
     if key == "corroboration":
-        components = {item.component for item in evidence.causal_chain if item.role in {"PRIMARY_CAUSE", "CONTRIBUTING", "OUTCOME"}}
-        return f"Corroboration observed across {len(components)} component(s)."
+        identities = {
+            _corroboration_identity_key(item)
+            for item in evidence.causal_chain
+            if item.role in {"PRIMARY_CAUSE", "CONTRIBUTING", "OUTCOME"}
+        }
+        if not identities or identities == {("unknown", "unknown")}:
+            return "Corroboration is limited to one source document and no independently identifiable second component was established."
+        if len(identities) == 1:
+            return "Corroboration comes from one independently identifiable component or source document."
+        return f"Corroboration observed across {len(identities)} independently identifiable components or sources."
     if key == "temporal_coherence":
-        return "Ordering of warning/error signals relative to terminal outcome supports the inferred chain."
+        timestamps_available = any(
+            (_evidence_timestamp_source(item) or "").lower().strip() in {"available", "parsed"}
+            for item in evidence.causal_chain
+        )
+        if timestamps_available:
+            return "Ordering of warning/error signals relative to terminal outcome supports the inferred chain."
+        return "Event sequence is preserved from document order, but observed timestamps are unavailable, so temporal causality cannot be verified."
     if key == "consistency":
         return "Failure-family consistency reflects how strongly evidence aligns to one mode."
     if key == "ambiguity_penalty":
@@ -1852,6 +1953,9 @@ def _report_actions_from_evidence(
 
     if semantic_code == "RESOURCE_ACCESS_FAILURE" or cause_type == "RESOURCE_ACCESS":
         return _evidence_grounded_actions("resource_access_failure", context.recovery_timeline)
+
+    if semantic_code == "SYSTEM_HEALTH_DEGRADATION" or cause_type == "SYSTEM_DEGRADATION":
+        return _evidence_grounded_actions("system_health_degradation", context.recovery_timeline)
 
     if semantic_code == "QUOTA_EXCEEDED" or cause_type == "STORAGE_CAPACITY" or "no space left" in primary_text:
         return [

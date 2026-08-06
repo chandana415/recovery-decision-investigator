@@ -83,7 +83,7 @@ class Timeline(BaseModel):
 
 class TimelineEntryContext(BaseModel):
     sequence: int
-    timestamp: str
+    timestamp: Optional[str] = None
     component: str
     level: LogLevel
     error_code: Optional[str] = None

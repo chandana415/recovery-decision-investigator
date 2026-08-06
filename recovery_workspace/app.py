@@ -7,7 +7,6 @@ from time import perf_counter
 import re
 from datetime import datetime, timezone
 from typing import Optional
-from uuid import uuid4
 
 import streamlit as st
 
@@ -110,14 +109,6 @@ def find_job_entry(entries: list[dict], job_query: str) -> Optional[dict]:
     return None
 
 
-def confidence_label(confidence: float) -> str:
-    if confidence >= 0.75:
-        return "High"
-    if confidence >= 0.4:
-        return "Medium"
-    return "Low"
-
-
 def format_duration(seconds: float) -> str:
     total_seconds = max(0, int(round(seconds)))
     hours, remainder = divmod(total_seconds, 3600)
@@ -201,32 +192,6 @@ def deterministic_mode_message(analysis_mode: str, used_fallback: bool) -> tuple
     return ("", "")
 
 
-def infer_operation(job_id: str) -> str:
-    text = job_id.lower()
-    if "restore" in text:
-        return "Recovery Restore"
-    if "weekly" in text:
-        return "Scheduled Full Backup"
-    if "nightly" in text:
-        return "Scheduled Nightly Backup"
-    return "Scheduled Backup"
-
-
-def infer_target(timeline) -> str:
-    patterns = [
-        r"storage account ([a-zA-Z0-9\-_]+)",
-        r"on ([a-zA-Z0-9\-_]+-bucket)",
-        r"for ([a-zA-Z0-9\-_]+/[a-zA-Z0-9\-_\.]+)",
-    ]
-    for entry in timeline.entries:
-        message = entry.event.message
-        for pattern in patterns:
-            match = re.search(pattern, message, re.IGNORECASE)
-            if match:
-                return match.group(1)
-    return "Primary backup target"
-
-
 def format_component_source(component: str) -> str:
     return component.replace("_", " ").title()
 
@@ -274,38 +239,6 @@ def parse_causal_event_identity(event_text: Optional[str]) -> tuple[Optional[str
     if not match:
         return None, None
     return match.group("component"), match.group("code")
-
-
-def terminal_outcome_sequence(timeline) -> Optional[int]:
-    terminal_codes = {"JOB_FAILED", "RETRY_EXHAUSTED", "PERMISSION_DENIED", "PARTIAL_SUCCESS"}
-    sequence = None
-    for entry in timeline.entries:
-        message = entry.event.message.lower()
-        if entry.event.error_code in terminal_codes or (
-            normalize_component_key(entry.event.component) == "backup-service"
-            and ("marked failed" in message or "completed with" in message or "marked succeeded" in message)
-        ):
-            sequence = entry.sequence
-    return sequence
-
-
-def causal_event_sequence(timeline, causal_event_text: Optional[str]) -> Optional[int]:
-    component, code = parse_causal_event_identity(causal_event_text)
-    if component is None and code is None:
-        return None
-    for entry in timeline.entries:
-        if component is not None and normalize_component_key(entry.event.component) != normalize_component_key(component):
-            continue
-        if code is not None and entry.event.error_code != code:
-            continue
-        return entry.sequence
-    return None
-
-
-def to_iso_utc(timestamp_text: str) -> str:
-    parsed = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
-    utc_time = parsed.astimezone(timezone.utc)
-    return utc_time.isoformat().replace("+00:00", "Z")
 
 
 def format_event_timestamp(
@@ -371,126 +304,6 @@ def evidence_timeline_items(evidence: InvestigationEvidence) -> list[dict[str, s
             }
         )
     return items
-
-
-def split_recommendations(
-    actions: list[str],
-    *,
-    root_cause_text: str,
-) -> tuple[list[str], list[str]]:
-    root_text = root_cause_text.lower()
-    if "quota" in root_text or "capacity" in root_text:
-        immediate = [
-            "Increase destination storage capacity or remove old backup artifacts.",
-            "Retry the failed backup after capacity has been restored.",
-        ]
-        preventative = [
-            "Configure earlier quota alerts.",
-            "Prevent backup jobs from starting when available capacity is below the required threshold.",
-            "Suppress retry loops for non-transient quota failures.",
-        ]
-        return immediate, preventative
-
-    deduped: list[str] = []
-    seen = set()
-    for action in actions:
-        key = action.strip().lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(action)
-
-    immediate: list[str] = []
-    preventative: list[str] = []
-    for action in deduped:
-        text = action.lower()
-        if any(
-            token in text
-            for token in (
-                "retry",
-                "restore",
-                "increase",
-                "stabilize",
-                "repair",
-                "re-run",
-                "isolate",
-                "roll back",
-            )
-        ):
-            immediate.append(action)
-        else:
-            preventative.append(action)
-
-    if not immediate and deduped:
-        immediate = deduped[:1]
-        preventative = deduped[1:]
-    if not preventative and len(immediate) > 1:
-        preventative = immediate[1:]
-        immediate = immediate[:1]
-    return immediate, preventative
-
-
-def root_cause_reason(summary_explanations: list[str]) -> str:
-    supportive_lines = [line.lstrip("✓ ").strip() for line in summary_explanations if line.strip().startswith("✓")]
-    if len(supportive_lines) >= 3:
-        return (
-            f"{supportive_lines[0]}. {supportive_lines[1]}. {supportive_lines[2]}. "
-            "No conflicting evidence was identified."
-        )
-    if supportive_lines:
-        return ". ".join(supportive_lines) + ". No conflicting evidence was identified."
-    return "Evidence is chronologically consistent and no conflicting signals were detected."
-
-
-def confidence_reason_lines(evidence: InvestigationEvidence) -> tuple[list[str], str]:
-    preferred = ["monitoring", "backup_service", "storage", "network", "auth", "encryption"]
-    available = {normalize_component_key(item.component) for item in evidence.causal_chain}
-    ordered = [component for component in preferred if normalize_component_key(component) in available]
-    if not ordered:
-        ordered = sorted(available)
-    lines = [f"{format_component_source(component)} events" for component in ordered[:3]]
-    conclusion = "All available evidence supported the same causal sequence."
-    if evidence.limitations:
-        conclusion += " " + evidence.limitations[0]
-    if evidence.confidence_explanation and any("No competing" in line for line in evidence.confidence_explanation):
-        conclusion += " No conflicting evidence was detected."
-    return lines, conclusion
-
-
-def recovered_scenario_sections(summary_text: str, timeline) -> dict[str, str]:
-    recovery_entries = [
-        entry for entry in timeline.entries
-        if entry.event.level == "INFO"
-        and any(
-            term in entry.event.message.lower()
-            for term in ("healthy", "recovered", "retry succeeded", "succeeded", "completed")
-        )
-    ]
-    outcome_entry = timeline.entries[-1].event.message if timeline.entries else ""
-    recovery_text = (
-        "Retry logic detected service recovery and automatically resumed processing."
-        if recovery_entries
-        else "Service recovered and processing resumed automatically."
-    )
-    return {
-        "Primary disruption": summary_text,
-        "Recovery": recovery_text,
-        "Successful outcome": outcome_entry,
-    }
-
-
-def job_option_label(entry: dict) -> str:
-    return f"{entry['job_id']} — {entry['outcome']} — {entry['customer']}"
-
-
-def customer_impact_text(outcome: str) -> str:
-    if outcome == "FAILED":
-        return "The scheduled backup did not complete successfully."
-    if outcome == "RECOVERED":
-        return "A transient service disruption occurred, but recovery logic completed the backup successfully."
-    if outcome == "PARTIAL_SUCCESS":
-        return "The backup completed with partial coverage; at least one workload did not complete successfully."
-    return f"The job completed with outcome status: {outcome}."
 
 
 def status_display(outcome: str) -> str:

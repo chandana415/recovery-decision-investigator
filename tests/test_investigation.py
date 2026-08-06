@@ -376,19 +376,19 @@ def test_grouped_timeline_preserves_all_underlying_evidence_ids_for_large_snapsh
             timestamp=None,
             timestamp_source="missing",
             component="monitoring",
-            event_type="OPERATIONAL_ERROR",
+            event_type="SYSTEM_HEALTH_DEGRADATION",
             terminal_state=None,
-            cause_type=None,
-            error_code="UNKNOWN_OPERATIONAL_ERROR",
-            semantic_error_code="UNKNOWN_OPERATIONAL_ERROR",
+            cause_type="SYSTEM_DEGRADATION",
+            error_code="PLAINTEXT",
+            semantic_error_code="SYSTEM_HEALTH_DEGRADATION",
             original_message="health HEALTH_ERR",
             message="health HEALTH_ERR",
             role="PRIMARY_CAUSE",
             source_file="monitoring.log",
             structured_fields={},
-            summary="Operational Error failure detected.",
-            display_summary="Operational Error failure detected.",
-            display_detail="Primary cause: health HEALTH_ERR",
+            summary="Critical system health degradation detected.",
+            display_summary="Critical system health degradation detected.",
+            display_detail="The supplied status snapshot shows degraded/inactive resources and unavailable services.",
         ),
         causal_chain=[
             EvidenceItem(
@@ -397,11 +397,11 @@ def test_grouped_timeline_preserves_all_underlying_evidence_ids_for_large_snapsh
                 timestamp=None,
                 timestamp_source="missing",
                 component="monitoring",
-                event_type="OPERATIONAL_ERROR" if index >= 3 else "INFO",
+                event_type="SYSTEM_HEALTH_DEGRADATION" if index >= 3 else "INFO",
                 terminal_state=None,
-                cause_type=None,
-                error_code="UNKNOWN_OPERATIONAL_ERROR" if index >= 3 else None,
-                semantic_error_code="UNKNOWN_OPERATIONAL_ERROR" if index >= 3 else None,
+                cause_type="SYSTEM_DEGRADATION" if index >= 3 else None,
+                error_code="PLAINTEXT" if index >= 3 else None,
+                semantic_error_code="SYSTEM_HEALTH_DEGRADATION" if index >= 3 else None,
                 original_message=message,
                 message=message,
                 role=role,
@@ -414,13 +414,13 @@ def test_grouped_timeline_preserves_all_underlying_evidence_ids_for_large_snapsh
             for index, role, message, summary_text in [
                 (1, "CONTEXT", "ceph -s", "Ceph -s"),
                 (2, "CONTEXT", "cluster 0d7a", "Cluster 0d7a"),
-                (3, "PRIMARY_CAUSE", "health HEALTH_ERR", "Operational Error failure detected."),
-                (4, "CONTRIBUTING", "128 pgs are stuck inactive", "Operational Error contributing condition."),
-                (5, "CONTRIBUTING", "64 pgs degraded", "Operational Error contributing condition."),
-                (6, "CONTRIBUTING", "64 pgs stale", "Operational Error contributing condition."),
-                (7, "CONTRIBUTING", "64 pgs stuck degraded", "Operational Error contributing condition."),
-                (8, "CONTRIBUTING", "64 pgs stuck inactive", "Operational Error contributing condition."),
-                (9, "CONTRIBUTING", "64 pgs stuck stale", "Operational Error contributing condition."),
+                (3, "PRIMARY_CAUSE", "health HEALTH_ERR", "Critical system health degradation detected."),
+                (4, "CONTRIBUTING", "128 pgs are stuck inactive", "Critical system health degradation contributing condition."),
+                (5, "CONTRIBUTING", "64 pgs degraded", "Critical system health degradation contributing condition."),
+                (6, "CONTRIBUTING", "64 pgs stale", "Critical system health degradation contributing condition."),
+                (7, "CONTRIBUTING", "64 pgs stuck degraded", "Critical system health degradation contributing condition."),
+                (8, "CONTRIBUTING", "64 pgs stuck inactive", "Critical system health degradation contributing condition."),
+                (9, "CONTRIBUTING", "64 pgs stuck stale", "Critical system health degradation contributing condition."),
                 (10, "CONTEXT", "ceph osd tree", "Ceph osd tree"),
                 (11, "CONTEXT", "ID WEIGHT TYPE NAME UP/DOWN", "ID WEIGHT TYPE NAME UP/DOWN"),
                 (12, "CONTEXT", "1 0.9 osd.1 down", "1 0.9 osd.1 down"),
@@ -471,7 +471,7 @@ def test_grouped_timeline_preserves_all_underlying_evidence_ids_for_large_snapsh
 
     titles = [item.title for item in report.timeline_items]
     assert len(report.timeline_items) <= 6
-    assert "Critical system health detected" in titles
+    assert "Critical system health degradation" in titles
     assert "Resource degradation observed" in titles
     assert "Resource availability issues detected" in titles
     assert "Evidence gap identified" in titles

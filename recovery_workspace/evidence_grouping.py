@@ -30,13 +30,6 @@ def _combined_text(item: EvidenceItem) -> str:
     return " ".join(bit for bit in bits if bit).lower()
 
 
-def _is_inventory_snapshot(text: str) -> bool:
-    if re.search(r"\b(id|weight|type|name|up/down|primary-affinity|root|host|quorum|epoch|map)\b", text):
-        return True
-    numeric_tokens = re.findall(r"\b\d+(?:\.\d+)?\b", text)
-    return len(numeric_tokens) >= 3 and bool(re.search(r"\b(up|down|in|out|host|root|tree|map)\b", text))
-
-
 def _contains_any(text: str, tokens: tuple[str, ...]) -> bool:
     return any(token in text for token in tokens)
 
@@ -65,6 +58,15 @@ def _is_pure_metadata(item: EvidenceItem) -> bool:
 
 
 def _primary_title(item: EvidenceItem) -> tuple[str, str]:
+    semantic_code = (item.semantic_error_code or "").upper()
+    cause_type = (item.cause_type or "").upper()
+    event_type = (item.event_type or "").upper()
+
+    if semantic_code == "SYSTEM_HEALTH_DEGRADATION" or cause_type == "SYSTEM_DEGRADATION" or event_type == "SYSTEM_HEALTH_DEGRADATION":
+        return "Critical system health degradation", "Critical system health degradation was selected as the primary finding."
+    if semantic_code == "RESOURCE_ACCESS_FAILURE" or cause_type == "RESOURCE_ACCESS" or event_type == "RESOURCE_ACCESS_FAILURE":
+        return "Resource access failure", "A resource-access failure was selected as the primary finding."
+
     text = _combined_text(item)
     if _contains_any(text, ("http 401", "401 unauthorized", "unauthorized")):
         return "HTTP 401 Unauthorized observed", "A downstream request received HTTP 401 Unauthorized."
@@ -74,8 +76,6 @@ def _primary_title(item: EvidenceItem) -> tuple[str, str]:
         return "Lock failure detected", "A lock refresh or concurrency failure was selected as the primary finding."
     if _contains_any(text, ("quota", "no space left", "disk full", "capacity", "enospc")):
         return "Quota exhaustion observed", "Storage capacity exhaustion was selected as the primary finding."
-    if _contains_any(text, ("health_err", "critical system health", "health warn", "health error")):
-        return "Critical system health detected", "Critical system health was selected as the primary finding."
     if _contains_any(text, ("cancelled", "canceled", "aborted")):
         return "Operation cancelled", "The selected primary finding indicates the operation was cancelled."
     return item.display_summary or item.summary or item.message, item.display_detail or item.message

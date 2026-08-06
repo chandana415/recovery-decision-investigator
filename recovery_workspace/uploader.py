@@ -1132,6 +1132,7 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
     lines = content.strip().split("\n")
     logs = []
     last_timestamp = None
+    saw_observed_timestamp = False
     last_component = extract_component_from_filename(source_filename) if source_filename else "unknown"
     last_level = "INFO"
 
@@ -1187,6 +1188,7 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
 
                 # Normalize timestamp
                 ts_str = data.get("timestamp", "")
+                timestamp_source = "parsed"
                 try:
                     # Try ISO 8601 first
                     if "T" in ts_str:
@@ -1196,9 +1198,11 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
                         timestamp = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
                         # Try to assume UTC if not specified
                         timestamp = timestamp.replace(tzinfo=timezone.utc)
+                    saw_observed_timestamp = True
                 except (ValueError, AttributeError):
-                    # If parsing fails, use last timestamp or current time
+                    # No observed timestamp in line: preserve ingest order with synthetic internal time.
                     timestamp = last_timestamp if last_timestamp else datetime.now(timezone.utc)
+                    timestamp_source = "missing"
 
                 # Update tracking variables for orphaned lines
                 last_timestamp = timestamp
@@ -1230,7 +1234,7 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
                     "errorCode": "PLAINTEXT" if last_level == "ERROR" else None,
                     "message": message_text,
                     "traceId": None,
-                    "structuredFields": {"timestamp_source": "parsed"},
+                    "structuredFields": {"timestamp_source": timestamp_source},
                 }
                 logs.append(log_entry)
                 matched = True
@@ -1255,7 +1259,7 @@ def try_parse_plaintext(content: str, source_filename: str = "") -> tuple[Option
                 "errorCode": "PLAINTEXT" if orphaned_level == "ERROR" else None,
                 "message": line,
                 "traceId": None,
-                "structuredFields": {"timestamp_source": "inherited"},
+                "structuredFields": {"timestamp_source": "inherited" if saw_observed_timestamp else "missing"},
             }
             logs.append(log_entry)
             last_level = orphaned_level
